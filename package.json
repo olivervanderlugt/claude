@@ -1,0 +1,27 @@
+{
+  "name": "percentile",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Consent-first analytics and benchmark data network for AI-built apps.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "node --import tsx --test test/**/*.test.ts",
+    "dev": "node --import tsx --watch src/api/server.ts",
+    "start": "node --import tsx src/api/server.ts",
+    "model": "node --import tsx scripts/model.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  },
+  "dependencies": {
+    "hono": "^4.6.14",
+    "@hono/node-server": "^1.13.7"
+  }
+}
