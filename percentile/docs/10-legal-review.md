@@ -31,8 +31,10 @@ is currently a claim you cannot substantiate.** Laplace noise is applied to *per
 sensitivity `(hi−lo)/contributorCount`. That is not the sensitivity of a quantile. Separately
 the ε budget is keyed per *(cohort, metric)* rather than per cohort, the period is
 caller-controlled, and the budget lives in a process-local `Map` that resets on every deploy.
-Marketing an unsound DP guarantee to buyers is the kind of claim the FTC treats as
-deceptive independently of whether anyone is re-identified.
+This is a substantiation problem before it is a privacy problem: an unsound guarantee sold to
+buyers is a misrepresentation exposure independent of whether anyone is ever re-identified.
+(I was not able to research the FTC's current positions on "anonymised" and "aggregated"
+claims — see the final section. Do that before publishing any DP claim.)
 
 **3. The law moved three weeks ago and moved against the framing.** On **7 July 2026** the
 EDPB adopted [Guidelines 02/2026 on Anonymisation](https://www.edpb.europa.eu/public-consultations/guidelines-022026-on-anonymisation_en)
@@ -45,6 +47,8 @@ outside material scope" line in `docs/04`. The *output* being anonymous never ex
 *act of producing it*, and the EDPB has now said so explicitly. See
 [Freshfields](https://www.freshfields.com/en/our-thinking/blogs/technology-quotient/anonymous-or-not-the-edpbs-new-draft-guidelines-on-anonymisation-102nbv5)
 and [Eversheds Sutherland](https://www.eversheds-sutherland.com/en/united-states/insights/edp-bs-new-guidelines-on-anonymisation-a-more-nuanced-approach-for-the-ai-era).
+⚠️ This proposition is drawn from commentary rather than the text — see §2 and the final
+section. It is the one headline claim here that should be checked first.
 
 The good news is real and worth stating: the *shape* of the design survives all three. The
 release gate as a single choke point is right. The layered consent model is right. The
@@ -222,10 +226,19 @@ The supporting law is now unusually clear:
 
 - **EDPB Guidelines 02/2026** state that anonymisation is itself a processing activity
   requiring an Article 6 legal basis, and an Article 9(2) exemption where special categories
-  are in play. This is a change from WP216, which had treated anonymisation as further
-  processing compatible with the original purpose and therefore not needing its own basis.
+  are in play. This is a change from WP216, which treated anonymisation as further processing
+  compatible with the original purpose and therefore **not** requiring its own basis
+  ([IAPP on the old position](https://iapp.org/news/a/does-anonymization-or-de-identification-require-consent-under-the-gdpr)).
   Anyone relying on the older position — as `docs/04` implicitly does — is relying on
   guidance the EDPB has just replaced.
+
+  ⚠️ **This specific proposition comes from law-firm commentary on the Guidelines, not from
+  the text itself, which I could not open.** It is the most consequential unverified claim
+  in this review. It is asserted consistently across
+  [Freshfields](https://www.freshfields.com/en/our-thinking/blogs/technology-quotient/anonymous-or-not-the-edpbs-new-draft-guidelines-on-anonymisation-102nbv5),
+  [Eversheds Sutherland](https://www.eversheds-sutherland.com/en/united-states/insights/edp-bs-new-guidelines-on-anonymisation-a-more-nuanced-approach-for-the-ai-era)
+  and others, which is why I have relied on it — but **verify it against the PDF before the
+  counsel engagement**, because if it is wrong, most of this section relaxes considerably.
 - **[EDPB Guidelines 07/2020 on controller and processor](https://www.edpb.europa.eu/system/files/documents/2023-10/EDPB_guidelines_202007_controllerprocessor_final_en.pdf)**:
   a processor that goes beyond the controller's instructions and determines its own purposes
   "will then be considered a controller in respect of that processing and may be subject to
@@ -243,16 +256,29 @@ already built. It just is not connected. Preferred, because it is the only route
 satisfies CCPA's opt-in for under-16s and keeps the "consent-first" positioning honest.
 
 **Route B — legitimate interest, with statistical-purpose framing.** Article 5(1)(b) treats
-further processing for statistical purposes as not incompatible with the original purpose,
-with Article 89 safeguards. And **Case C-621/22 (KNLTB), 4 October 2024** confirms purely
-commercial interests are not categorically excluded from being legitimate interests
+further processing for statistical purposes as **not incompatible** with the original
+purpose, subject to Article 89(1) safeguards — and where that presumption applies, no
+separate Article 6(4) compatibility test is needed. **Recital 162** conditions "statistical
+purposes" on the result being **aggregate** and **not used for measures or decisions
+regarding any particular natural person**. A k-anonymised, DP-noised cohort statistic fits
+that description unusually well. Benchmarks fit; per-user targeting would not.
+
+And **Case C-621/22 (KNLTB), 4 October 2024** confirms purely commercial interests are not
+categorically excluded from being legitimate interests
 ([A&O Shearman](https://www.aoshearman.com/en/insights/ao-shearman-on-data/cjeu-commercial-interests-of-controller-can-serve-as-a-legitimate-interest),
 [Hogan Lovells](https://www.hoganlovells.com/en/publications/cjeu-clears-the-air-dutch-dpas-interpretation-of-legitimate-interests-is-too-strict)).
+The CNIL's [June 2025 guidance](https://www.cnil.fr/en/relying-legal-basis-legitimate-interests-develop-ai-system)
+also accepts legitimate interest for "improving a product or service to increase its
+performance", provided data subjects are informed of the risks and can **object in advance
+and at any time without that affecting their use of the service**.
+
 This is a real option for **Layer 2 benchmarks**, where the benefit flows back to the same
-population. I would **not** rely on it for Layer 3: the balancing test fails on reasonable
-expectations once a third party pays for the output, which is exactly the argument `docs/04`
-itself makes at "Legitimate interest does not stretch this far" — and that argument is
-correct.
+population and the Recital 162 framing is honest. I would **not** rely on it for Layer 3: the
+balancing test fails on reasonable expectations once a third party pays for the output,
+which is exactly the argument `docs/04` itself makes at "Legitimate interest does not stretch
+this far" — and that argument is correct. Note also that the Article 5(1)(b) presumption
+will **not** carry reuse for AI-model training, which is not "statistical purposes" because
+the object is not to produce aggregate data.
 
 Note that Route B does not avoid the transparency duty either. Under SRB, the duty to
 identify recipients is assessed at collection from the controller's perspective, before any
@@ -691,9 +717,11 @@ Member-state divergence is real and does not help:
   **Read that against this product.** "Exclusively for the publisher's account" and "no
   cross-referencing with other processing" are precisely what cross-workspace benchmarking
   is. A tracker that feeds the co-op **cannot** claim the CNIL exemption for the same
-  collection. If you want to offer an exemption-eligible mode in France, it has to be a
-  genuinely separate, co-op-excluded configuration — and that is a product decision, not a
-  banner tweak.
+  collection. If you want an exemption-eligible mode in France it must be a genuinely
+  separate, siloed, co-op-excluded configuration, enforced technically and per workspace —
+  and since the public list was withdrawn on 1 January 2026, **the burden of proving the
+  exemption now sits with Percentile and its customers**, in pre-sales and on audit. That
+  is a product decision and a documentation obligation, not a banner tweak.
 - **Germany.** TDDDG § 25 requires consent for analytics. The DSK's guidance is that reach
   measurement may be used without consent only where it does **not** rely on external
   third-party services. Percentile is by definition an external third party. **Consent
@@ -921,9 +949,23 @@ Stated plainly, because a review that hides its gaps is worse than useless.
   confirm.
 - **Whether EDPB Guidelines 1/2024 on legitimate interest are final.** Relevant to Route B
   in §2.
-- **Texas, Oregon and Vermont statutory text.** I have the citations, not the definitions,
-  and specifically not whether each has a deidentified/aggregate carve-out equivalent to
-  California's § 1798.145(a)(5).
+- **Oregon's and Vermont's absence of a deidentification carve-out is a *negative* finding
+  from search summaries, not a confirmed reading of the statute.** "No carve-out found" is
+  not "no carve-out exists". This is the single most important thing on this page to verify
+  directly, because it decides whether deidentification works as a compliance strategy
+  outside California and Texas. Also unconfirmed: the exact subsection for the California
+  deletion-request penalty (§ 1798.99.86(d)(1) vs § 1798.99.82(c)(2)), the registration fee
+  ($6,000 vs $6,600), and AB 566's codified Civil Code section.
+- **Colorado's registry status** (sources conflict) and any New York budget-bill broker
+  provisions.
+- **FTC positions on "anonymised" and "aggregated" claims.** Not researched — the search
+  budget ran out. Kochava, X-Mode/Outlogic, InMarket, Gravy Analytics/Venntel, Mobilewalla
+  and the FTC's business-blog posts on the limits of hashing are all real matters that bear
+  directly on marketing an unsound DP guarantee (§1), and **none of it is covered in this
+  review**. Someone should run it before any buyer-facing claim about differential privacy
+  is published. The material sits at `ftc.gov/business-guidance/blog` and
+  `ftc.gov/legal-library/browse/cases-proceedings`; Kochava is litigated rather than settled,
+  so its status needs the docket.
 - **COPPA amended rule compliance dates and the third-party-disclosure consent change**, and
   the **member-state Article 8 age table**. Search budget ran out before these; treat §7's
   children analysis as directionally right but unverified on dates.
