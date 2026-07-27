@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import { ingest } from '../src/core/ingest.ts';
 import { ConsentLedger } from '../src/core/consent.ts';
+import { deriveConsentAnchor } from '../src/core/identity.ts';
 import { compare, percentileRank } from '../src/core/aggregate/benchmarks.ts';
 import { settle } from '../src/core/monetization/revenue-share.ts';
 import type { AggregateRelease, RawEvent } from '../src/core/types.ts';
@@ -57,14 +58,10 @@ describe('ingest', () => {
 
   test('accepts EU traffic once consent is on the ledger', () => {
     const ledger = new ConsentLedger();
-    const probe = ingest(rawEvent({ context: { jurisdiction: 'US' } }), {
-      identity: IDENTITY,
-      ledger,
-    });
-    assert.equal(probe.accepted, true);
-    if (!probe.accepted) return;
-
-    grantAll(ledger, 'ws_1', probe.event.subjectKey);
+    // Consent is keyed on the stable anchor, not the rotating subjectKey. This test
+    // previously granted against probe.event.subjectKey, which encoded the old keying —
+    // the one that let withdrawals expire at the next epoch. See consent-durability.test.ts.
+    grantAll(ledger, 'ws_1', deriveConsentAnchor(IDENTITY, 'ws_1', 'device_abc'));
     const out = ingest(rawEvent({ context: { jurisdiction: 'EU' } }), { identity: IDENTITY, ledger });
     assert.equal(out.accepted, true);
     if (!out.accepted) return;

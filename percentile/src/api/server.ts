@@ -19,7 +19,7 @@ import { Hono } from 'hono';
 
 import { ConsentLedger } from '../core/consent.ts';
 import { ingest } from '../core/ingest.ts';
-import { deriveSubjectKey, subjectKeysForRetentionWindow } from '../core/identity.ts';
+import { deriveConsentAnchor, subjectKeysForRetentionWindow } from '../core/identity.ts';
 import { gateRelease } from '../core/privacy/release-gate.ts';
 import { PrivacyBudget } from '../core/privacy/differential-privacy.ts';
 import { compare } from '../core/aggregate/benchmarks.ts';
@@ -122,7 +122,10 @@ app.post('/v1/consent', async (c) => {
   }
 
   const at = body.occurredAt ?? new Date().toISOString();
-  const subjectKey = deriveSubjectKey(identity, workspaceId, body.identifier, at);
+  // Recorded against the stable anchor so the decision outlives the 30-day pseudonym
+  // epoch. Recording against the rotating key would expire this consent — and, worse,
+  // expire a *withdrawal* back to a jurisdiction default that is `granted` in the US.
+  const subjectKey = deriveConsentAnchor(identity, workspaceId, body.identifier);
 
   for (const [purpose, granted] of Object.entries(body.purposes) as Array<[ConsentPurpose, boolean]>) {
     ledger.append({
@@ -156,11 +159,20 @@ app.post('/v1/erasure', async (c) => {
     RETENTION_DAYS,
   );
 
+  // Rows are stored under rotating keys, so deletion has to sweep every epoch in the
+  // window. Withdrawal is recorded once, against the stable anchor — writing it against
+  // the rotating keys would make the withdrawal itself expire at the next epoch, which
+  // is the whole bug this anchor exists to prevent.
   let deleted = 0;
   for (const key of keys) {
     deleted += store.deleteSubject(workspaceId, key);
-    ledger.withdrawAll(workspaceId, key, body.jurisdiction ?? 'unknown', now);
   }
+  ledger.withdrawAll(
+    workspaceId,
+    deriveConsentAnchor(identity, workspaceId, body.identifier),
+    body.jurisdiction ?? 'unknown',
+    now,
+  );
 
   // Already-published aggregates are not recalled: they are anonymous, contain no
   // personal data, and cannot be attributed back to this subject. Saying so plainly

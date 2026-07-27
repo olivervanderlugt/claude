@@ -7,7 +7,7 @@
  */
 
 import { ConsentLedger } from './consent.ts';
-import { deriveSubjectKey, type IdentityConfig } from './identity.ts';
+import { deriveConsentAnchor, deriveSubjectKey, type IdentityConfig } from './identity.ts';
 import { ipToCountry, redactProperties } from './redaction.ts';
 import type { BuilderTag, CleanEvent, ConsentPurpose, RawEvent } from './types.ts';
 
@@ -57,10 +57,15 @@ export function ingest(raw: RawEvent, deps: IngestDeps): IngestOutcome {
     raw.occurredAt,
   );
 
+  // Consent is looked up under the stable anchor, NOT the rotating subjectKey. Keying
+  // consent on a value that rotates every 30 days expires withdrawals silently — see
+  // deriveConsentAnchor. The event itself is still stored under the rotating key.
+  const consentAnchor = deriveConsentAnchor(deps.identity, raw.workspaceId, raw.identifier);
+
   const jurisdiction = raw.context?.jurisdiction || 'unknown';
   const permittedPurposes: ConsentPurpose[] = deps.ledger.permittedPurposes(
     raw.workspaceId,
-    subjectKey,
+    consentAnchor,
     jurisdiction,
   );
 

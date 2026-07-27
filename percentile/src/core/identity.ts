@@ -64,6 +64,43 @@ export function deriveSubjectKey(
 }
 
 /**
+ * Derive the stable *consent anchor* for a subject.
+ *
+ * Deliberately NOT epoch-rotated, and that is a considered trade-off rather than an
+ * oversight. Consent decisions are keyed on this instead of on `subjectKey`, because a
+ * rotating key silently expires withdrawals: once the epoch flips, the ledger no longer
+ * has an entry for that person, `resolve()` falls back to the jurisdiction default, and
+ * in the US that default is `granted`. A Californian who withdrew would be re-enrolled
+ * 30 days later without ever being asked — which is precisely the failure the California
+ * DROP regime prices at $200 per request per day.
+ *
+ * The cost is honest: this is a persistent per-workspace pseudonym, so it is a stronger
+ * identifier than `subjectKey`. Two things keep it defensible. It is still keyed per
+ * workspace, so it cannot link a person across apps. And it is used *only* for consent
+ * and suppression bookkeeping, never to key behavioural events — the analytics store
+ * still sees rotating keys, so no long-run behavioural profile can be assembled from it.
+ *
+ * You cannot honour "never contact me again" without remembering who asked. Suppression
+ * lists work this way for the same reason.
+ */
+export function deriveConsentAnchor(
+  config: IdentityConfig,
+  workspaceId: WorkspaceId,
+  rawIdentifier: string,
+): SubjectKey {
+  if (!config.rootSecret || config.rootSecret.length < 32) {
+    throw new Error('identity: rootSecret must be at least 32 characters');
+  }
+  if (!rawIdentifier) throw new Error('identity: rawIdentifier is required');
+
+  const scoped = createHmac('sha256', config.rootSecret)
+    .update(`consent-anchor:${workspaceId}`)
+    .digest();
+
+  return createHmac('sha256', scoped).update(rawIdentifier).digest('hex').slice(0, 32);
+}
+
+/**
  * Verify a subject key without exposing the derivation — used by the erasure endpoint,
  * where a subject presents a raw identifier and we must find their rows without
  * ever logging the raw value.
