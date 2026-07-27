@@ -1,0 +1,34 @@
+name: percentile-ci
+
+# Scoped to percentile/** on purpose. This repository hosts more than one project, and
+# an unfiltered workflow would fire on unrelated commits and report failures against
+# code it does not own.
+on:
+  push:
+    paths:
+      - 'percentile/**'
+      - '.github/workflows/percentile-ci.yml'
+  pull_request:
+    paths:
+      - 'percentile/**'
+      - '.github/workflows/percentile-ci.yml'
+
+defaults:
+  run:
+    working-directory: percentile
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: percentile/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      # The model is documentation that executes. If it breaks, docs/02 is stale.
+      - run: npm run model -- all

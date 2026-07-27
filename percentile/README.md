@@ -92,17 +92,30 @@ Read [docs/08-risks.md](docs/08-risks.md) before anything else. The short form:
 - Revenue is back-loaded. Data licensing cannot start until the network exists, which in
   the base case is month 14.
 
-## Moving this to its own repository
+## Where this lives
 
-This was built inside an existing repo because the session that created it did not have
-permission to create new GitHub repositories. The project is self-contained and the full
-history moves across:
+This project is namespaced under `percentile/` because the repository hosts more than one
+project. Everything it owns is inside that directory, with one unavoidable exception:
+`.github/workflows/percentile-ci.yml`, since GitHub only reads workflows from the repo
+root. That workflow is path-filtered to `percentile/**` so it cannot fire on, or report
+failures against, anyone else's commits.
+
+Run all commands from `percentile/`.
+
+### Moving it to its own repository
+
+It was built here because the session that created it lacked permission to create new
+GitHub repositories. `git subtree split` extracts this directory and its history alone —
+nothing from any other project comes across:
 
 ```bash
 # 1. Create an empty repo at https://github.com/new — no README, no .gitignore
-# 2. Then:
-./scripts/split-out-repo.sh git@github.com:<you>/percentile.git
+# 2. From the repository root:
+./percentile/scripts/split-out-repo.sh git@github.com:<you>/percentile.git
 ```
+
+The script refuses to run on a dirty tree, prints the extracted file list, and asks for
+confirmation before pushing.
 
 ## Status
 
