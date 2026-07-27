@@ -252,7 +252,7 @@ function Lobby({
   onKick: (playerId: string) => void;
 }) {
   return (
-    <div className="flex flex-1 flex-col">
+    <div className="my-auto flex flex-col">
       <div className="quiz-card mx-auto w-full max-w-3xl px-6 py-8 text-center">
         <p className="text-sm uppercase tracking-[0.2em] opacity-60">
           Join at
@@ -300,6 +300,48 @@ function Lobby({
   );
 }
 
+/**
+ * The four answer colours and shapes, matching the player screen exactly.
+ *
+ * They have to match: the whole point of the shared screen is that a player
+ * reads "the red triangle" on the projector and taps the red triangle on their
+ * phone. Because the server sends the same shuffled payload to host and
+ * players, index `i` is the same option on both.
+ */
+const TILE_COLORS = [
+  "var(--q-answer-1)",
+  "var(--q-answer-2)",
+  "var(--q-answer-3)",
+  "var(--q-answer-4)",
+];
+const TILE_SHAPES = ["▲", "◆", "●", "■", "★", "⬟"];
+
+/**
+ * The options as the room should see them.
+ *
+ * Returns an empty list for types with nothing to display on a shared screen —
+ * a text or slider answer would give the game away or simply has no options —
+ * and the caller falls back to a "answer on your device" prompt.
+ */
+function displayOptions(
+  payload: HostQuestionView["payload"],
+): Array<{ id: string; text: string }> {
+  switch (payload.type) {
+    case "MULTIPLE_CHOICE":
+    case "MULTIPLE_SELECT":
+    case "POLL":
+      return payload.options.map((o) => ({ id: o.id, text: o.text }));
+    case "TRUE_FALSE":
+      // Ids match the distribution keys the server sends back on reveal.
+      return [
+        { id: "true", text: "True" },
+        { id: "false", text: "False" },
+      ];
+    default:
+      return [];
+  }
+}
+
 function QuestionStage({
   view,
   answered,
@@ -309,8 +351,10 @@ function QuestionStage({
   answered: number;
   total: number;
 }) {
+  const options = displayOptions(view.payload);
+
   return (
-    <div className="mx-auto flex w-full max-w-5xl flex-1 flex-col">
+    <div className="mx-auto my-auto flex w-full max-w-6xl flex-col">
       <p className="text-center text-sm opacity-60">
         Question {view.index + 1} of {view.total}
       </p>
@@ -324,16 +368,39 @@ function QuestionStage({
         <img
           src={view.presentation.media}
           alt={view.presentation.mediaAlt ?? ""}
-          className="mx-auto mt-6 max-h-64 rounded-xl object-contain"
+          className="mx-auto mt-6 max-h-56 rounded-xl object-contain"
         />
       ) : null}
 
-      <div className="mt-auto pt-8">
-        <p className="numeric text-center text-3xl font-bold">
-          {answered}
-          <span className="text-xl opacity-60"> / {total} answered</span>
+      {options.length > 0 ? (
+        <ul
+          className={`mt-8 grid gap-3 ${
+            options.length > 4 ? "sm:grid-cols-3" : "sm:grid-cols-2"
+          }`}
+        >
+          {options.map((option, i) => (
+            <li
+              key={option.id}
+              className="answer-tile flex min-h-20 items-center gap-4 px-5 py-5 text-2xl font-bold text-white"
+              style={{ background: TILE_COLORS[i % TILE_COLORS.length] }}
+            >
+              <span aria-hidden className="text-3xl opacity-90">
+                {TILE_SHAPES[i % TILE_SHAPES.length]}
+              </span>
+              <span className="flex-1">{option.text}</span>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="mt-10 text-center text-xl opacity-70">
+          Answer on your device
         </p>
-      </div>
+      )}
+
+      <p className="numeric mt-10 text-center text-3xl font-bold">
+        {answered}
+        <span className="text-xl opacity-60"> / {total} answered</span>
+      </p>
     </div>
   );
 }
@@ -346,10 +413,11 @@ function RevealStage({
   reveal: RevealPayload;
 }) {
   const { distribution } = reveal;
+  const options = displayOptions(view.payload);
   const max = Math.max(1, ...Object.values(distribution.counts));
 
   return (
-    <div className="mx-auto flex w-full max-w-4xl flex-1 flex-col">
+    <div className="mx-auto my-auto flex w-full max-w-5xl flex-col">
       <h1 className="quiz-display text-balance text-center text-2xl font-bold sm:text-3xl">
         {view.prompt}
       </h1>
@@ -374,26 +442,61 @@ function RevealStage({
         </p>
       ) : null}
 
-      {/* Answer distribution — a live histogram of what the room picked. */}
-      {Object.keys(distribution.counts).length > 0 ? (
-        <ul className="mt-8 space-y-2">
-          {Object.entries(distribution.counts).map(([key, count]) => {
-            const isCorrect = reveal.correctIds.includes(key);
+      {/*
+        Answer distribution.
+
+        Iterates the options rather than the counts, so an option nobody picked
+        still gets a row — "nobody chose C" is exactly the kind of thing a
+        teacher wants to see, and it vanishes if you only render what was
+        submitted. Labels use the answer text; the raw option ids mean nothing
+        to the room.
+      */}
+      {options.length > 0 ? (
+        <ul className="mt-8 space-y-2.5">
+          {options.map((option, i) => {
+            const count = distribution.counts[option.id] ?? 0;
+            const isCorrect = reveal.correctIds.includes(option.id);
             return (
-              <li key={key} className="flex items-center gap-3">
-                <span className="w-24 shrink-0 truncate text-sm opacity-70">
-                  {key}
+              <li key={option.id} className="flex items-center gap-3">
+                <span
+                  aria-hidden
+                  className="w-7 shrink-0 text-center text-xl"
+                  style={{ color: TILE_COLORS[i % TILE_COLORS.length] }}
+                >
+                  {TILE_SHAPES[i % TILE_SHAPES.length]}
                 </span>
-                <span className="h-8 flex-1 overflow-hidden rounded-lg bg-white/10">
+                <span
+                  className="w-44 shrink-0 truncate text-lg font-semibold"
+                  style={{ opacity: isCorrect ? 1 : 0.55 }}
+                >
+                  {option.text}
+                </span>
+                <span className="h-9 flex-1 overflow-hidden rounded-lg bg-white/10">
                   <span
-                    className="block h-full rounded-lg transition-all"
+                    className="block h-full rounded-lg transition-all duration-500"
                     style={{
-                      width: `${(count / max) * 100}%`,
-                      background: isCorrect ? "var(--q-correct)" : "var(--q-wrong)",
+                      width: `${Math.max((count / max) * 100, count > 0 ? 4 : 0)}%`,
+                      background: isCorrect
+                        ? "var(--q-correct)"
+                        : TILE_COLORS[i % TILE_COLORS.length],
+                      opacity: isCorrect ? 1 : 0.45,
                     }}
                   />
                 </span>
-                <span className="numeric w-10 text-right font-bold">{count}</span>
+                <span className="numeric w-12 text-right text-lg font-bold">
+                  {count}
+                </span>
+                {isCorrect ? (
+                  <span
+                    aria-label="correct answer"
+                    className="w-6 text-xl"
+                    style={{ color: "var(--q-correct)" }}
+                  >
+                    ✓
+                  </span>
+                ) : (
+                  <span className="w-6" />
+                )}
               </li>
             );
           })}
@@ -434,7 +537,9 @@ function Scoreboard({
   title: string;
 }) {
   return (
-    <div className="mx-auto w-full max-w-2xl">
+    // Centred vertically: this is a projector screen, and content pinned to the
+    // top of a 16:9 display reads as broken from the back of a room.
+    <div className="mx-auto my-auto flex w-full max-w-2xl flex-col">
       <h1 className="quiz-display mb-6 text-center text-3xl font-extrabold">
         {title}
       </h1>
