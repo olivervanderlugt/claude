@@ -1,0 +1,61 @@
+# Quizzly — local development and small single-host production.
+#
+#   cp .env.example .env      # then fill in the two secrets
+#   docker compose up --build
+#
+# The app waits for Postgres to be genuinely ready (not merely started) via the
+# healthcheck condition below, which avoids the classic "app boots, database
+# isn't listening yet, container crash-loops" first-run experience.
+
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-quizzly}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-quizzly}
+      POSTGRES_DB: ${POSTGRES_DB:-quizzly}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-quizzly} -d ${POSTGRES_DB:-quizzly}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    # Not published to the host by default — the app reaches it over the
+    # compose network. Uncomment only if you need a GUI client attached.
+    # ports:
+    #   - "5432:5432"
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      APP_ORIGIN: ${APP_ORIGIN:-http://localhost:3000}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-quizzly}:${POSTGRES_PASSWORD:-quizzly}@db:5432/${POSTGRES_DB:-quizzly}?schema=public
+      SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET in .env — generate with: openssl rand -base64 32}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?set ENCRYPTION_KEY in .env — generate with: openssl rand -base64 32}
+      # Optional — leave unset and the app runs fine without AI generation.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      AI_MODEL: ${AI_MODEL:-claude-opus-5}
+      AI_RATE_LIMIT_PER_HOUR: ${AI_RATE_LIMIT_PER_HOUR:-20}
+      MAX_PLAYERS_PER_GAME: ${MAX_PLAYERS_PER_GAME:-500}
+      MAX_QUESTIONS_PER_QUIZ: ${MAX_QUESTIONS_PER_QUIZ:-100}
+    ports:
+      - "${PORT:-3000}:3000"
+    # Apply migrations before serving. `migrate deploy` only ever applies
+    # already-committed migrations — it never generates or resets anything, so
+    # it is safe to run automatically on every boot.
+    command: >
+      sh -c "node_modules/.bin/prisma migrate deploy &&
+             node_modules/.bin/tsx server/index.ts"
+
+volumes:
+  postgres-data:

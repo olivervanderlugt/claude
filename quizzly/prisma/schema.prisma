@@ -1,0 +1,271 @@
+// Quizzly data model.
+//
+// Two privacy decisions are baked into this schema rather than left to
+// application code, because they are the two things most expensive to retrofit:
+//
+//  1. PLAYERS ARE NOT USERS. Joining a game creates a `Player` row with a
+//     nickname and nothing else — no email, no account, no IP stored. A class of
+//     13-year-olds can play without anyone processing their personal data, which
+//     keeps the whole live-game path out of GDPR "children's data" territory.
+//     See docs/LEGAL.md.
+//
+//  2. CONTRIBUTED QUESTIONS ARE BLIND BY CONSTRUCTION. A collaborative quiz's
+//     questions carry `authorId` + `revealedAt`. Nothing is readable by other
+//     contributors until the game reaches it — enforced in the data layer
+//     (src/lib/collab.ts), not just hidden in the UI.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────── Accounts ───────────────────────────────────
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  displayName  String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  // Optional per-user Anthropic key, AES-256-GCM encrypted at rest so users can
+  // spend their own AI budget instead of the operator's. Null = use server key.
+  encryptedAiKey String?
+
+  sessions     Session[]
+  quizzes      Quiz[]
+  hostedGames  Game[]
+  contributions CollabContributor[]
+  authoredQuestions Question[] @relation("QuestionAuthor")
+
+  @@index([email])
+}
+
+model Session {
+  // Stores a SHA-256 hash of the session token, never the token itself, so a
+  // database leak cannot be replayed as a login.
+  id        String   @id
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+// ──────────────────────────────── Quizzes ───────────────────────────────────
+
+enum QuizMode {
+  /// Normal quiz: the owner writes every question.
+  SOLO
+  /// Blind group quiz: contributors each submit questions nobody else can see
+  /// until the game plays them.
+  COLLAB
+}
+
+enum QuizVisibility {
+  PRIVATE
+  UNLISTED
+  PUBLIC
+}
+
+enum CollabStage {
+  /// Contributors can still join and submit.
+  COLLECTING
+  /// Submissions closed, quiz is ready to host.
+  LOCKED
+}
+
+model Quiz {
+  id          String         @id @default(cuid())
+  ownerId     String
+  owner       User           @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  title       String
+  description String?
+  coverImage  String?
+  mode        QuizMode       @default(SOLO)
+  visibility  QuizVisibility @default(PRIVATE)
+
+  /// Full theme definition (palette, fonts, background, answer shapes).
+  /// Stored inline rather than referenced so a quiz keeps its look forever even
+  /// if the built-in theme catalogue changes underneath it.
+  theme Json
+
+  /// Gameplay settings: scoring curve, streaks, shuffle, music, reveal rules.
+  settings Json
+
+  // ── Collaborative-quiz fields (null for SOLO) ──
+  collabCode       String?     @unique
+  collabStage      CollabStage @default(COLLECTING)
+  /// How many questions each contributor is asked to submit.
+  collabQuota      Int         @default(3)
+  /// Show "written by <name>" after each question is answered.
+  collabRevealAuthors Boolean  @default(true)
+  /// Set if the owner used the moderation escape hatch to read submissions
+  /// before the game. Contributors are shown this, because "the host can
+  /// secretly read everything" would quietly break the promise the feature
+  /// makes. Once set it is never cleared.
+  ownerReviewedAt  DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  questions    Question[]
+  games        Game[]
+  contributors CollabContributor[]
+
+  @@index([ownerId])
+  @@index([collabCode])
+}
+
+enum QuestionType {
+  MULTIPLE_CHOICE
+  MULTIPLE_SELECT
+  TRUE_FALSE
+  TYPE_ANSWER
+  NUMERIC
+  ORDERING
+  MATCHING
+  SLIDER
+  POLL
+  WORD_CLOUD
+}
+
+model Question {
+  id       String       @id @default(cuid())
+  quizId   String
+  quiz     Quiz         @relation(fields: [quizId], references: [id], onDelete: Cascade)
+  order    Int
+  type     QuestionType
+  prompt   String
+
+  /// Type-specific payload — options, correct answers, tolerances, pairs.
+  /// Validated by a per-type Zod schema (src/lib/question-schema.ts) on every
+  /// write, so "JSON column" never means "unvalidated column".
+  payload Json
+
+  /// Presentation overrides for this one question: layout, media, accent.
+  presentation Json
+
+  timeLimitSec Int    @default(20)
+  points       Int    @default(1000)
+  explanation  String?
+
+  // ── Blind-contribution fields ──
+  /// Who wrote it. Null for questions the quiz owner wrote directly.
+  authorId String?
+  author   User?    @relation("QuestionAuthor", fields: [authorId], references: [id], onDelete: SetNull)
+  /// Display name captured at submit time, so the credit survives account deletion.
+  authorName String?
+  /// Set the moment a live game first shows this question. Until then, the read
+  /// layer refuses to return `payload`/`prompt` to anyone but the author.
+  revealedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([quizId, order])
+  @@index([authorId])
+}
+
+model CollabContributor {
+  id      String @id @default(cuid())
+  quizId  String
+  quiz    Quiz   @relation(fields: [quizId], references: [id], onDelete: Cascade)
+  userId  String
+  user    User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// Denormalised so the leaderboard of "who contributed" survives deletion.
+  displayName String
+  joinedAt DateTime @default(now())
+
+  @@unique([quizId, userId])
+  @@index([quizId])
+}
+
+// ───────────────────────────────── Games ────────────────────────────────────
+
+enum GameStatus {
+  LOBBY
+  QUESTION
+  REVEAL
+  SCOREBOARD
+  ENDED
+}
+
+model Game {
+  id     String     @id @default(cuid())
+  quizId String
+  quiz   Quiz       @relation(fields: [quizId], references: [id], onDelete: Cascade)
+  hostId String
+  host   User       @relation(fields: [hostId], references: [id], onDelete: Cascade)
+
+  /// 6-digit join code. Released for reuse once the game ends.
+  pin    String     @unique
+  status GameStatus @default(LOBBY)
+
+  currentIndex Int @default(-1)
+
+  /// Immutable copy of the quiz at start time. A game in progress must not
+  /// change under the players' feet if the owner edits the quiz mid-session.
+  quizSnapshot Json
+
+  startedAt DateTime?
+  endedAt   DateTime?
+  createdAt DateTime  @default(now())
+
+  players Player[]
+  answers Answer[]
+
+  @@index([pin])
+  @@index([hostId])
+  @@index([status])
+}
+
+model Player {
+  id       String   @id @default(cuid())
+  gameId   String
+  game     Game     @relation(fields: [gameId], references: [id], onDelete: Cascade)
+  /// The only thing we ever collect from a player. Profanity-filtered on join.
+  nickname String
+  score    Int      @default(0)
+  streak   Int      @default(0)
+  bestStreak Int    @default(0)
+  connected Boolean @default(true)
+  kicked   Boolean  @default(false)
+  joinedAt DateTime @default(now())
+
+  answers Answer[]
+
+  @@unique([gameId, nickname])
+  @@index([gameId, score])
+}
+
+model Answer {
+  id            String @id @default(cuid())
+  gameId        String
+  game          Game   @relation(fields: [gameId], references: [id], onDelete: Cascade)
+  playerId      String
+  player        Player @relation(fields: [playerId], references: [id], onDelete: Cascade)
+  questionIndex Int
+
+  /// The player's raw submission, shape depends on question type.
+  response Json
+
+  correct       Boolean
+  pointsAwarded Int
+  /// Milliseconds from question start to submission — the speed-bonus input.
+  responseMs    Int
+
+  createdAt DateTime @default(now())
+
+  // One answer per player per question, enforced by the database rather than
+  // by a check in the socket handler — this is the anti-cheat backstop.
+  @@unique([gameId, playerId, questionIndex])
+  @@index([gameId, questionIndex])
+}
