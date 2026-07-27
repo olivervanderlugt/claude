@@ -43,8 +43,13 @@ device clock skew.
 
 ## Quick start
 
+> **Note:** this repository currently hosts a second, unrelated project under
+> `percentile/`. Everything Quizzly owns lives in `quizzly/` and the two share no
+> files, ports or CI. To pull Quizzly out into its own repository, see
+> [`docs/MOVING-TO-ITS-OWN-REPO.md`](docs/MOVING-TO-ITS-OWN-REPO.md).
+
 ```bash
-git clone <your-repo-url> quizzly && cd quizzly
+git clone <your-repo-url> && cd <repo>/quizzly   # already standalone? just cd in
 cp .env.example .env
 
 # Generate the two required secrets
