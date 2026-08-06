@@ -11,7 +11,6 @@
     "dev": "tsx watch --clear-screen=false server/index.ts",
     "build": "prisma generate && next build",
     "start": "NODE_ENV=production tsx server/index.ts",
-    "lint": "next lint",
     "typecheck": "tsc --noEmit",
     "db:generate": "prisma generate",
     "db:push": "prisma db push",

@@ -1,0 +1,50 @@
+# Runs on every push to main and every pull request.
+#
+# No `paths:` filter and no `working-directory:` — this workflow assumes it sits
+# at the repository root, which is where GitHub reads workflows from. If Quizzly
+# is ever vendored back into a subdirectory of a larger repo, this file stops
+# running entirely rather than running against the wrong tree.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same branch instead of queueing them.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: typecheck / test / build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm test
+
+      # `npm run build` is `prisma generate && next build`. Prisma resolves
+      # env("DATABASE_URL") while reading the datasource block but never opens a
+      # connection, so a placeholder is correct here. Next's build phase is
+      # handled inside src/lib/env.ts, which substitutes placeholders when
+      # NEXT_PHASE === "phase-production-build" — no real secrets are needed to
+      # compile, and none should ever be baked into a build.
+      - name: Build
+        run: npm run build
+        env:
+          DATABASE_URL: postgresql://placeholder:placeholder@localhost:5432/placeholder

@@ -1,8 +1,10 @@
 # Move Quizzly into its own repo
 
-Follow these five steps in order. Copy each block, paste, press enter.
+Quizzly was built inside a shared repository, in a `quizzly/` subdirectory
+alongside an unrelated project. This is how it was moved out — with its history
+intact, and without carrying anything belonging to the other project.
 
-Total time: about five minutes, most of it waiting for Docker.
+Copy each block, paste it into Terminal, press enter.
 
 ---
 
@@ -13,48 +15,114 @@ Go to <https://github.com/new>.
 - **Repository name:** `quizzly`
 - Leave **Add a README**, **.gitignore** and **licence** all **unticked**
 
-This folder already has all three. Ticking them creates a conflict on your
-first push.
-
-Click **Create repository**, then come back here.
+This project already has all three. Ticking them creates a conflict on the first
+push.
 
 ---
 
-## 2. Copy the folder out
+## 2. Make sure GitHub will accept the push
+
+The clone you are working from may be authenticated with a *deploy key* — a key
+scoped to one repository. It will refuse to push to a different one:
+
+```
+ERROR: Permission to olivervanderlugt/quizzly.git denied to deploy key
+```
+
+Check what GitHub thinks you are:
 
 ```bash
-git clone https://github.com/olivervanderlugt/claude.git /tmp/claude-src
-cd /tmp/claude-src
+ssh -T git@github.com
+```
+
+If it greets a **repository** (`Hi olivervanderlugt/claude!`) rather than your
+**account** (`Hi olivervanderlugt!`), fix it with an account-level key:
+
+```bash
+ssh-keygen -t ed25519 -C "your@email.com" -f ~/.ssh/id_ed25519_github -N ""
+cat >> ~/.ssh/config <<'EOF'
+
+Host github.com
+  HostName github.com
+  User git
+  IdentityFile ~/.ssh/id_ed25519_github
+  IdentitiesOnly yes
+EOF
+chmod 600 ~/.ssh/config
+pbcopy < ~/.ssh/id_ed25519_github.pub
+```
+
+`IdentitiesOnly yes` is the line that actually fixes it. Without it SSH keeps
+offering the deploy key first and GitHub keeps rejecting it.
+
+The public key is now on your clipboard. Paste it at
+<https://github.com/settings/ssh/new>, give it any title, click **Add SSH key**.
+
+Verify before going further — this must name your account:
+
+```bash
+ssh -T git@github.com
+```
+
+---
+
+## 3. Split the subdirectory out, with its history
+
+`git subtree split` rewrites the commits that touched `quizzly/` into a new
+branch where `quizzly/` is the root. Commits that never touched it — including
+every commit belonging to the other project — are not carried across.
+
+```bash
+git clone https://github.com/olivervanderlugt/claude.git /tmp/quizzly-migrate
+cd /tmp/quizzly-migrate
 git checkout claude/kahoot-quiz-platform-mvp-uol97e
-cp -r quizzly ~/quizzly
+git subtree split --prefix=quizzly -b quizzly-main
+git checkout quizzly-main
 ```
 
-You now have a complete, standalone copy at `~/quizzly`. The original repo is
-untouched.
+Look before you push:
+
+```bash
+ls -A
+git rev-list --count HEAD
+```
+
+You should see this project's files at the top level — `package.json`, `src`,
+`server`, `prisma`, `CLAUDE.md`, `.github` — and **no** other project's
+directory. If anything unexpected is there, stop.
 
 ---
 
-## 3. Push it
+## 4. Push it
 
 ```bash
+git remote add quizzly git@github.com:olivervanderlugt/quizzly.git
+git push quizzly quizzly-main:main
+```
+
+`quizzly-main:main` names the destination branch explicitly, so the local
+working name doesn't matter.
+
+---
+
+## 5. Check it from a fresh clone
+
+Not the folder you just pushed from — a clean one, the way a new collaborator
+gets it:
+
+```bash
+git clone git@github.com:olivervanderlugt/quizzly.git ~/quizzly
 cd ~/quizzly
-git init -b main
-git add .
-git commit -m "Initial commit: Quizzly"
-git remote add origin git@github.com:olivervanderlugt/quizzly.git
-git push -u origin main
+npm ci && npm run typecheck && npm test && npm run build
 ```
 
-If `git push` asks for a password, you don't have SSH keys set up. Run this
-instead and try the push again:
-
-```bash
-git remote set-url origin https://github.com/olivervanderlugt/quizzly.git
-```
+Then open the repo's **Actions** tab. CI runs automatically on the push:
+`.github/workflows/ci.yml` is now at the repository root, which is the only
+place GitHub reads workflows from.
 
 ---
 
-## 4. Create your secrets
+## 6. Create your secrets and run it
 
 ```bash
 cd ~/quizzly
@@ -63,18 +131,13 @@ printf 'SESSION_SECRET=%s\nENCRYPTION_KEY=%s\n' \
   "$(openssl rand -base64 32)" "$(openssl rand -base64 32)" >> .env
 ```
 
-`.env` is gitignored and never gets committed, which is why you generate your
-own. The app checks these at startup and refuses to boot if they're missing or
-still set to the placeholder — that's deliberate.
+`.env` is gitignored and never committed, which is why you generate your own.
+The app checks these at startup and refuses to boot if they are missing or still
+set to the placeholder — that is deliberate.
 
----
-
-## 5. Run it
-
-Needs Docker Desktop running. Install from <https://docker.com> if you haven't.
+Needs Docker Desktop running (<https://docker.com>):
 
 ```bash
-cd ~/quizzly
 docker compose up --build
 ```
 
@@ -82,7 +145,7 @@ Wait for `Quizzly ready on http://localhost:3000`, then in a **second terminal**
 
 ```bash
 cd ~/quizzly
-docker compose exec app node_modules/.bin/tsx prisma/seed.ts
+docker compose exec app npm run db:seed
 ```
 
 Open <http://localhost:3000> and sign in:
@@ -90,20 +153,41 @@ Open <http://localhost:3000> and sign in:
 - **Email:** `demo@quizzly.local`
 - **Password:** `demo-password-123`
 
-You'll have a quiz with all ten question types. Click **Host**, then open the
-site on your phone and enter the PIN.
+You get a quiz using all ten question types. Click **Host**, then open the site
+on your phone and enter the PIN.
 
 To stop: `Ctrl-C`, then `docker compose down`.
 
 ---
 
-## Done. What's next
+## 7. Remove the original — only once the new repo works
+
+The old copy stays where it is until you have confirmed the new repo builds and
+runs. When you have:
+
+```bash
+cd /tmp/quizzly-migrate
+git checkout claude/kahoot-quiz-platform-mvp-uol97e
+git rm -r --quiet quizzly
+git commit -m "Remove quizzly — migrated to its own repository"
+git push origin claude/kahoot-quiz-platform-mvp-uol97e
+```
+
+This deletes **only** the `quizzly/` directory. The other project and the shared
+repository's own `.github/` are untouched. Do not delete the repository itself.
+
+---
+
+## What's next
 
 Open the folder in VS Code and start a Claude Code session there:
 
 ```bash
 code ~/quizzly
 ```
+
+`CLAUDE.md` at the root tells Claude how to run the project and which invariants
+not to break, so a fresh session starts oriented.
 
 Three things are worth doing before anyone else uses this, in priority order:
 
@@ -124,14 +208,3 @@ ANTHROPIC_API_KEY=sk-ant-...
 ```
 
 Nothing else depends on it — every other feature works without it.
-
----
-
-## One thing not to do
-
-The repo you cloned from in step 2 also contains an unrelated project under
-`percentile/`. Step 2 only copies `quizzly/` out and changes nothing, so you're
-safe by default.
-
-If you later want to tidy that repo, delete **only** the `quizzly/` directory.
-Don't delete the repo, `percentile/`, or `.github/`.
