@@ -1,0 +1,31 @@
+name: CI
+
+# Dormant until this project is split into its own repository.
+#
+# GitHub only reads workflows from `.github/workflows` at the REPOSITORY ROOT. While
+# this project lives at `percentile/` inside a shared repo, this file sits one level
+# too deep and is ignored — the active workflow there is the path-filtered
+# `.github/workflows/percentile-ci.yml` at that repo's root.
+#
+# After `scripts/split-out-repo.sh` extracts `percentile/` as its own repo, this file
+# lands at the root and takes over. No path filters and no working-directory, because
+# by then the project IS the root.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      # The model is documentation that executes. If it breaks, docs/02 is stale.
+      - run: npm run model -- all
