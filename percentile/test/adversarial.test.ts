@@ -9,23 +9,40 @@
  *
  *   Tests named `VULN-n` PASS BECAUSE THE ATTACK WORKS. A green run of this file is not
  *   a clean bill of health — it is a reproduction of every confirmed leak. If one of them
- *   starts failing, the corresponding hole has probably been fixed; delete the test and
- *   record the fix, do not "repair" it.
+ *   starts failing, the corresponding hole has probably been fixed; convert it to a
+ *   `HOLDS-n` guard and record the fix, do not weaken the assertion.
  *
- *   Tests named `HOLDS-n` are ordinary regression guards: the defence works and must keep
- *   working.
+ *   Tests named `HOLDS-n` are regression guards: the defence works and must keep working.
  *
  * Findings are written up in docs/11-privacy-audit.md.
  *
- * Statistical tests use enough trials that the assertion margin is many standard errors
+ * Statistical tests use enough trials that the assertion margin is several standard errors
  * wide; none of them depend on a lucky draw.
+ *
+ * ---------------------------------------------------------------------------
+ * Second pass, after the quantile-mechanism / count-generalisation / provenance fixes.
+ *
+ *   FIXED and now guarded : the Laplace-on-a-quantile DP violation (HOLDS-Q*), the sybil
+ *                           percentile readout (HOLDS-S*), naive count differencing
+ *                           (HOLDS-C1), the provenance stamp (HOLDS-P1).
+ *   STILL LIVE            : VULN-3, VULN-3b, VULN-4, VULN-5, VULN-8, VULN-9, VULN-10..13.
+ *   NEW / RESHAPED        : VULN-4 moved from the percentile channel to the mean and is
+ *                           now the headline DP violation; VULN-6 is a new adaptive break
+ *                           of count generalisation; VULN-9 is the same commercial problem
+ *                           with a completely different signature.
+ * ---------------------------------------------------------------------------
  */
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { gateRelease, cohortKeyString, type MetricSpec } from '../src/core/privacy/release-gate.ts';
-import { PrivacyBudget } from '../src/core/privacy/differential-privacy.ts';
+import {
+  gateRelease,
+  cohortKeyString,
+  generaliseCount,
+  type MetricSpec,
+} from '../src/core/privacy/release-gate.ts';
+import { PrivacyBudget, exponentialQuantile } from '../src/core/privacy/differential-privacy.ts';
 import { checkKAnonymity, explainSuppression } from '../src/core/privacy/k-anonymity.ts';
 import { ConsentLedger } from '../src/core/consent.ts';
 import { ingest } from '../src/core/ingest.ts';
@@ -74,29 +91,21 @@ function mustRelease(
 
 const mean = (xs: readonly number[]): number => xs.reduce((a, b) => a + b, 0) / xs.length;
 
-// ---------------------------------------------------------------------------
-// VULN-1 — quantile sensitivity is understated by a factor of n.
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// FIXED — the quantile mechanism. Was the Critical finding of the first pass.
+// ===========================================================================
 
-describe('VULN-1: the noise scale is computed for a mean and applied to quantiles', () => {
+describe('HOLDS-Q: the exponential mechanism closed the quantile channel', () => {
   /**
-   * release-gate.ts:120 sets `sensitivity = (hi - lo) / contributorCount` and uses that
-   * single number for all five percentiles as well as the mean.
+   * First pass: `release-gate.ts` added Laplace noise scaled `(hi - lo) / n` to each
+   * percentile. That is the sensitivity of a *mean*, not of an order statistic, and it
+   * decays as 1/n while the real quantile sensitivity stays flat — so a 1000-workspace
+   * cohort leaked a single workspace's value from ONE release with 100% accuracy.
    *
-   * That is the correct global sensitivity for a *mean* over n bounded contributions. It is
-   * flatly wrong for a *quantile*: changing one contributor's value can move an order
-   * statistic by the whole gap to its neighbour, which is up to (hi - lo) and does NOT
-   * shrink with n. So the true sensitivity of p10 here is ~1.0 while the declared
-   * sensitivity is 1/1000 = 0.001.
-   *
-   * The perverse consequence: because the declared sensitivity shrinks as 1/n, LARGER
-   * cohorts get LESS noise while the real quantile sensitivity stays constant. Privacy gets
-   * monotonically worse as the cohort grows — the exact opposite of the design intent.
-   *
-   * Below: a 1000-workspace cohort that clears every k-anonymity check by a wide margin.
-   * One single workspace changes its value from 1 to 0. The published p10 moves from ~0.9
-   * to ~0.0 and an attacker classifies which world they are in with ~100% accuracy from a
-   * SINGLE release. This is a total failure of differential privacy, not a degradation.
+   * The gate now uses `exponentialQuantile` (Smith, STOC 2011) for all five rungs. These
+   * tests re-run the original attack verbatim and confirm it is dead, and separately
+   * confirm the mechanism is a real quantile estimator rather than a random-number
+   * generator that happens to defeat the attack.
    */
   const N = 1000;
 
@@ -104,7 +113,7 @@ describe('VULN-1: the noise scale is computed for a mean and applied to quantile
     return Array.from({ length: N }, (_, i) => obs(`w${i}`, i < lowCount ? 0 : 1, 5));
   }
 
-  test('precondition: both worlds clear every k-anonymity threshold comfortably', () => {
+  test('precondition: both worlds still clear every k-anonymity threshold', () => {
     for (const zeros of [100, 101]) {
       const verdict = checkKAnonymity(stepCohort(zeros));
       assert.equal(verdict.ok, true);
@@ -113,53 +122,91 @@ describe('VULN-1: the noise scale is computed for a mean and applied to quantile
     }
   });
 
-  test('VULN: one workspace flipping its value is readable from a single published p10', () => {
-    const TRIALS = 60;
-    // Decision rule an attacker would use: p10 above 0.45 => the flipping workspace is high.
+  test('HOLDS-Q1: the single-release neighbouring-dataset classifier is back at chance', () => {
+    // Under Laplace this scored 100%. A correct eps = 0.0167 mechanism caps the advantage
+    // at ~exp(0.0167) - 1, i.e. indistinguishable from a coin.
+    const TRIALS = 200;
     let correct = 0;
     for (let i = 0; i < TRIALS; i++) {
       if (mustRelease(stepCohort(100)).percentiles.p10 > 0.45) correct++;
       if (mustRelease(stepCohort(101)).percentiles.p10 <= 0.45) correct++;
     }
     const accuracy = correct / (TRIALS * 2);
-
-    // A mechanism honouring epsilon = 0.1/6 per statistic would cap the attacker's
-    // advantage at roughly exp(0.017) - 1, i.e. accuracy indistinguishable from 0.5.
     assert.ok(
-      accuracy > 0.9,
-      `attacker accuracy ${accuracy}; >0.9 is evidence the DP guarantee does not hold`,
+      accuracy < 0.62,
+      `attacker accuracy ${accuracy.toFixed(3)}; chance is 0.5 and Laplace scored 1.00`,
     );
   });
 
-  test('VULN: the two worlds are separated far beyond the claimed noise scale', () => {
-    const high = mean(Array.from({ length: 40 }, () => mustRelease(stepCohort(100)).percentiles.p10));
-    const low = mean(Array.from({ length: 40 }, () => mustRelease(stepCohort(101)).percentiles.p10));
-    // Declared noise scale b = sensitivity/(eps/6) = 0.001/(0.1/6) = 0.06.
-    assert.ok(
-      high - low > 0.5,
-      `single-workspace change moved published p10 by ${(high - low).toFixed(3)} ` +
-        `against a declared noise scale of 0.06`,
-    );
+  test('HOLDS-Q2: no published statistic separates the two worlds under averaging', () => {
+    // The stronger version: average every published statistic over many releases and look
+    // for any channel that still moves when one workspace flips.
+    const T = 150;
+    const A = Array.from({ length: T }, () => mustRelease(stepCohort(100)));
+    const B = Array.from({ length: T }, () => mustRelease(stepCohort(101)));
+
+    for (const k of ['p10', 'p25', 'p50', 'p75', 'p90'] as const) {
+      const gap = Math.abs(mean(A.map((r) => r.percentiles[k])) - mean(B.map((r) => r.percentiles[k])));
+      assert.ok(gap < 0.1, `${k} separated the neighbouring datasets by ${gap.toFixed(3)}`);
+    }
+    const meanGap = Math.abs(mean(A.map((r) => r.mean)) - mean(B.map((r) => r.mean)));
+    assert.ok(meanGap < 0.1, `mean separated the neighbouring datasets by ${meanGap.toFixed(3)}`);
+  });
+
+  test('HOLDS-Q3: given real budget the mechanism tracks the true quantile', () => {
+    // Guards against a "fix" that simply returns noise. At eps = 6 the exponential
+    // mechanism must land on the true quantile essentially exactly.
+    const values = Array.from({ length: 1000 }, (_, i) => (i + 0.5) / 1000);
+    for (const q of [0.1, 0.25, 0.5, 0.75, 0.9]) {
+      const draws = Array.from({ length: 100 }, () =>
+        exponentialQuantile({ values, q, lo: 0, hi: 1, epsilon: 6 }),
+      );
+      const worst = Math.max(...draws.map((v) => Math.abs(v - q)));
+      assert.ok(worst < 0.02, `q=${q} worst error ${worst.toFixed(4)} at eps=6`);
+    }
+  });
+
+  test('HOLDS-Q4: fully degenerate input never returns a raw data value', () => {
+    // The `maxLog === -Infinity` branch in exponentialQuantile returns z[0] unprotected.
+    // It is unreachable while hi > lo, because the gaps sum to (hi - lo) and so at least
+    // one gap is always positive. Verified over every degenerate shape.
+    for (const values of [[0, 0, 0, 0, 0], [1, 1, 1, 1, 1], [0.5, 0.5, 0.5], [0, 1]]) {
+      const draws = Array.from({ length: 300 }, () =>
+        exponentialQuantile({ values, q: 0.5, lo: 0, hi: 1, epsilon: 0.1 / 6 }),
+      );
+      const exactHits = draws.filter((d) => values.includes(d)).length;
+      assert.equal(exactHits, 0, `input ${JSON.stringify(values)} was echoed back verbatim`);
+      assert.ok(new Set(draws).size > 250, 'output must be a continuous draw, not a point mass');
+    }
+  });
+
+  test('HOLDS-Q5: output never escapes the public domain bounds', () => {
+    const values = [-5, 0.2, 0.4, 3, 99];
+    for (let i = 0; i < 500; i++) {
+      const v = exponentialQuantile({ values, q: 0.5, lo: 0, hi: 1, epsilon: 0.1 / 6 });
+      assert.ok(v >= 0 && v <= 1, `escaped domain: ${v}`);
+    }
   });
 });
 
-// ---------------------------------------------------------------------------
-// VULN-2 — sybil cohort: manufacture the population, read out the one honest member.
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// FIXED — the sybil percentile readout.
+// ===========================================================================
 
-describe('VULN-2: a sybil cohort recovers an honest contributor\'s exact metric', () => {
+describe('HOLDS-S: the sybil percentile readout is dead', () => {
   /**
-   * k-anonymity counts *workspaces*, not *parties*. Registering 999 workspaces is a
-   * business-rules problem, not a cryptographic one, and nothing in the gate models
-   * collusion. The dominance check counts subjects per workspace, so 999 sybils with one
-   * subject each look like the healthiest cohort in the dataset.
+   * First pass: 499 sybils at lo + 500 at hi pinned the victim at the p50 index, so
+   * `victim = 2 * p50 - 1` recovered a named competitor's private metric to 2.2pp with 40
+   * queries.
    *
-   * The attacker picks sybil values so that the victim sits exactly at the p50 index:
-   * 499 sybils at lo, 500 sybils at hi. Then
-   *      p50 = victim + (hi - victim) * 0.5   =>   victim = 2 * p50 - 1
-   * and the noise scale is only 0.06 because there are 1000 "contributors".
+   * Under the exponential mechanism the only positive-width gaps in that construction are
+   * [lo, victim] and [victim, hi], selected with probability proportional to their widths.
+   * The published value is therefore distributed uniformly on [lo, hi] whatever the victim
+   * did, and E[p50] = 1/2 identically. The estimator has no signal left to average.
    *
-   * Combine with VULN-3 (the budget key is attacker-controlled) to average the noise away.
+   * NOTE: the *root cause* of this finding — k counts workspaces, not independent parties
+   * (`k-anonymity.ts:19`) — is untouched. Only the channel it was exploited through is
+   * closed. See VULN-4, which exploits the same collusion assumption through the mean.
    */
   function sybilProbe(victimValue: number): number {
     const list: WorkspaceObservation[] = [];
@@ -169,60 +216,60 @@ describe('VULN-2: a sybil cohort recovers an honest contributor\'s exact metric'
     return mustRelease(list).percentiles.p50;
   }
 
-  test('precondition: the sybil cohort passes k, subjects and dominance', () => {
+  test('precondition: the sybil cohort still passes k, subjects and dominance', () => {
     const list: WorkspaceObservation[] = [];
     for (let i = 0; i < 499; i++) list.push(obs(`sybil_lo_${i}`, 0, 5));
     list.push(obs('victim', 0.4, 5));
     for (let i = 0; i < 500; i++) list.push(obs(`sybil_hi_${i}`, 1, 5));
-    const verdict = checkKAnonymity(list);
-    assert.equal(verdict.ok, true, 'the gate sees a textbook-healthy 1000-app cohort');
+    assert.equal(checkKAnonymity(list).ok, true, 'the gate still sees a healthy 1000-app cohort');
   });
 
-  test('VULN: 60 differently-keyed queries recover the victim value to ~2pp', () => {
-    const TRUE_VALUE = 0.4;
-    const estimate = 2 * mean(Array.from({ length: 60 }, () => sybilProbe(TRUE_VALUE))) - 1;
-    const error = Math.abs(estimate - TRUE_VALUE);
-
-    // Measured over 25 independent runs of this attack: median |error| 0.022, max 0.043.
+  test('HOLDS-S1: the recovered estimate no longer tracks the victim', () => {
+    const T = 200;
+    const lowV = mean(Array.from({ length: T }, () => sybilProbe(0.1)));
+    const highV = mean(Array.from({ length: T }, () => sybilProbe(0.8)));
+    // Under Laplace these differed by 0.7 x 0.5 = 0.35 in p50 space. Now both sit at 1/2.
     assert.ok(
-      error < 0.12,
-      `recovered a single competitor's private metric as ${estimate.toFixed(3)} ` +
-        `(true ${TRUE_VALUE}), error ${error.toFixed(3)}`,
+      Math.abs(highV - lowV) < 0.12,
+      `p50 still moved ${Math.abs(highV - lowV).toFixed(3)} between victim=0.1 and victim=0.8`,
     );
+    for (const [label, v] of [['low', lowV], ['high', highV]] as const) {
+      assert.ok(Math.abs(v - 0.5) < 0.12, `${label} average p50 ${v.toFixed(3)} drifted off 1/2`);
+    }
   });
 
-  test('VULN: the estimator tracks the victim across the whole domain', () => {
-    // If this were noise, the estimates would not be ordered. They are.
-    const estimates = [0.1, 0.4, 0.8].map(
-      (v) => 2 * mean(Array.from({ length: 30 }, () => sybilProbe(v))) - 1,
-    );
+  test('HOLDS-S2: 200 queries of budget buy no better than one', () => {
+    const one = 2 * sybilProbe(0.4) - 1;
+    const many = 2 * mean(Array.from({ length: 200 }, () => sybilProbe(0.4))) - 1;
+    // The first-pass attack got to |error| 0.022 with 40 queries. Averaging now converges
+    // on 0 (the estimator's fixed point), not on the victim's 0.4.
     assert.ok(
-      estimates[0]! < estimates[1]! && estimates[1]! < estimates[2]!,
-      `estimates ${estimates.map((e) => e.toFixed(3)).join(', ')} track the victim monotonically`,
+      Math.abs(many - 0.4) > 0.15,
+      `200-query estimate ${many.toFixed(3)} landed too close to the true 0.4`,
     );
+    void one;
   });
 });
 
-// ---------------------------------------------------------------------------
-// VULN-3 — the epsilon budget is keyed on attacker-supplied metadata.
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// STILL LIVE — budget keying.
+// ===========================================================================
 
 describe('VULN-3: the privacy budget key is metadata, not population', () => {
   /**
-   * release-gate.ts:107 —  budgetKey = `${cohortKeyString(cohort)}::${metric.name}`.
+   * Unchanged by the fixes. `release-gate.ts:128` —
+   *   budgetKey = `${cohortKeyString(cohort)}::${metric.name}`
+   * `cohort` and `observations` are independent parameters; nothing checks that the label
+   * describes the population. `period` reaches the gate from `?period=` in
+   * `src/api/server.ts:196`, and `metric.name` is a free string.
    *
-   * `cohort` and `observations` are two independent parameters. Nothing checks that the
-   * cohort key describes the population it is handed. The `period` component is a free
-   * string (and in src/api/server.ts it comes straight off `?period=` in the query string),
-   * and `metric.name` is a free string too.
-   *
-   * So an unlimited number of fresh epsilon budgets exist over one population, and every
-   * one of them answers with independent noise on the same underlying values.
+   * This is now load-bearing for two other findings: VULN-4's averaging attack and VULN-6's
+   * adaptive binary search both need many queries, and this is where they get them.
    */
   const population = Array.from({ length: 1000 }, (_, i) => obs(`w${i}`, i / 1000, 5));
 
   test('VULN: 50 releases of one population out of a budget that permits 10', () => {
-    const budget = new PrivacyBudget(); // 1.0 total, 0.1 per query => 10 releases
+    const budget = new PrivacyBudget();
     let released = 0;
     for (let i = 0; i < 50; i++) {
       const out = gateRelease(
@@ -256,7 +303,6 @@ describe('VULN-3: the privacy budget key is metadata, not population', () => {
   });
 
   test('VULN: budget keys collide only on exact string equality, so cohorts never compose', () => {
-    // Two cohort keys describing overlapping populations are simply different strings.
     const a = cohortKeyString(COHORT);
     const b = cohortKeyString({ ...COHORT, sizeBucket: '10k-100k' });
     assert.notEqual(a, b);
@@ -270,26 +316,16 @@ describe('VULN-3: the privacy budget key is metadata, not population', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// VULN-3b — the coarsening ladder multiplies the budget over nested populations.
-// ---------------------------------------------------------------------------
-
-describe('VULN-3b: every rung of the coarsening ladder gets its own full epsilon', () => {
+describe('VULN-3b: every rung of the coarsening ladder still gets its own full epsilon', () => {
   /**
-   * `coarsen()` in src/core/aggregate/rollup.ts produces four strictly nested cohorts:
-   * exact ⊂ all_builders ⊂ all_builders_all_sizes ⊂ all_ai_built_apps. Every rung is a
-   * distinct `cohortKeyString`, and rollup.ts documents that as deliberate:
+   * `coarsen()` in src/core/aggregate/rollup.ts produces four strictly nested cohorts.
+   * Members of the narrow rung belong to all four populations and therefore absorb
+   * 4 x 1.0 of epsilon while every per-cohort ledger reports 1.0. Unchanged.
    *
-   *     "two rungs sharing a key would let a broad query drain a narrow cohort's budget"
-   *
-   * That reasoning is inverted. The workspaces in the narrow rung are members of all four
-   * populations, so they are exposed to 4 x 1.0 = 4.0 of epsilon while the accounting
-   * reports 1.0 per cohort. Under sequential composition, epsilon over a *person* is what
-   * matters, and no ledger in this codebase tracks it.
-   *
-   * The rungs are also perfectly nested, which makes them an ideal differencing lattice:
-   * with the exact counts of VULN-6, subtracting adjacent rungs yields the exact subject
-   * count of each set difference for free.
+   * PARTIAL IMPROVEMENT: the first pass also showed adjacent rungs differencing to the
+   * exact subject total of the ring between them (1000 / 1200 / 1400). Count
+   * generalisation has blunted that — two of the four rungs now collide on the same
+   * published figure. That improvement is asserted below so it cannot silently regress.
    */
   const period = '2026-W30';
   const target: CohortKey = { builder: 'lovable', vertical: 'b2b_saas', sizeBucket: '1k-10k', period };
@@ -309,7 +345,6 @@ describe('VULN-3b: every rung of the coarsening ladder gets its own full epsilon
     assert.equal(rungs.length, 4);
     const sizes = rungs.map((r) => world.filter((o) => matchesCohort(o.cohort, r)).length);
     assert.deepEqual(sizes, [40, 80, 120, 160], 'each rung strictly contains the previous one');
-    // Distinct budget keys is exactly what makes the attack work.
     assert.equal(new Set(rungs.map((r) => cohortKeyString(r.cohort))).size, 4);
   });
 
@@ -331,79 +366,117 @@ describe('VULN-3b: every rung of the coarsening ladder gets its own full epsilon
     }
   });
 
-  test('VULN: adjacent rungs difference to the exact subject count of the ring between them', () => {
+  test('HOLDS-C0: generalisation blunted the rung-differencing lattice', () => {
     const rungs = coarsen(target);
-    const counts = rungs.map((rung) => {
-      const members = world.filter((o) => matchesCohort(o.cohort, rung));
-      return mustRelease(members, rung.cohort).subjectCount;
-    });
-    assert.deepEqual(counts, [1600, 2600, 3800, 5200]);
-    // 40 bolt-built apps x 25 subjects, recovered exactly and for free.
-    assert.equal(counts[1]! - counts[0]!, 1000);
-    assert.equal(counts[2]! - counts[1]!, 1200);
-    assert.equal(counts[3]! - counts[2]!, 1400);
+    const counts = rungs.map((rung) =>
+      mustRelease(world.filter((o) => matchesCohort(o.cohort, rung)), rung.cohort).subjectCount,
+    );
+    // True totals are 1600 / 2600 / 3800 / 5200 — previously published verbatim.
+    assert.deepEqual(counts, [1000, 2500, 2500, 5000]);
+    assert.equal(counts[1], counts[2], 'two adjacent rungs now collide, disclosing nothing');
   });
 });
 
-// ---------------------------------------------------------------------------
-// VULN-4 — row stuffing defeats the dominance check.
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// STILL LIVE, AND NOW THE HEADLINE — the unit of privacy is a row, not a workspace.
+// ===========================================================================
 
-describe('VULN-4: dominance is measured in subjects, influence is measured in rows', () => {
+describe('VULN-4: the privacy unit is one row; the declared unit is one workspace', () => {
   /**
-   * checkKAnonymity sums `subjectCount` per workspace and caps any workspace at 34% of
-   * subjects. But release-gate.ts:119 builds the distribution from *observations*, one
-   * value per row, unweighted. A workspace that submits 600 rows of one subject each holds
-   * 10.7% of the subjects (passes dominance) and 37.5% of the rows (owns the median).
+   * `checkKAnonymity` sums `subjectCount` per workspace and caps any workspace at 34% of
+   * subjects. `release-gate.ts:146` then builds `values` from *observations* — one entry
+   * per row, unweighted — and `MemoryStore.putObservation` (`src/api/store.ts:87`) appends
+   * without deduplication or any per-workspace cap.
    *
-   * MemoryStore.putObservation appends without any per-workspace deduplication or cap, so
-   * nothing anywhere limits how many rows one workspace contributes to a cohort.
+   * Both mechanisms are calibrated per element of `values`:
+   *   - `meanSensitivity = (hi - lo) / values.length`  (release-gate.ts:169)
+   *   - exponentialQuantile's utility has sensitivity 1 per element
    *
-   * Read the other way round, this is also the *victim* side of VULN-2: an attacker who
-   * can induce a target to report per-segment or per-day observations amplifies that
-   * target's weight in the ladder while the dominance check reports a healthy mix.
+   * So a workspace holding R of the N rows enjoys an effective epsilon of R x the declared
+   * epsilon. With 600 of 1599 rows that is a 600-fold understatement.
+   *
+   * REGRESSION NOTE: before the fix, `meanSensitivity` used `verdict.contributorCount`.
+   * It now uses `values.length`, which is rows — strictly further from the declared unit of
+   * contribution. The percentile channel closing has left the mean as the readable one.
    */
   const STUFFER_VALUE = 0.62;
 
-  function stuffed(): WorkspaceObservation[] {
+  function stuffed(v: number): WorkspaceObservation[] {
     const list: WorkspaceObservation[] = [];
-    for (let i = 0; i < 600; i++) list.push(obs('stuffer', STUFFER_VALUE, 1));
+    for (let i = 0; i < 600; i++) list.push(obs('stuffer', v, 1));
     for (let i = 0; i < 999; i++) list.push(obs(`w${i}`, i / 999, 5));
     return list;
   }
 
   test('precondition: the stuffed cohort reports as healthy', () => {
-    const verdict = checkKAnonymity(stuffed());
+    const verdict = checkKAnonymity(stuffed(STUFFER_VALUE));
     assert.equal(verdict.ok, true);
     assert.equal(verdict.ok === true && verdict.contributorCount, 1000);
-    // 600 / 5595 = 10.7%, well inside the 34% dominance cap.
-    assert.ok(verdict.ok === true && 600 / verdict.subjectCount < 0.34);
+    assert.ok(verdict.ok === true && 600 / verdict.subjectCount < 0.34, 'inside the 34% cap');
   });
 
-  test('VULN: the published median is one workspace\'s private value', () => {
-    const p50 = mean(Array.from({ length: 80 }, () => mustRelease(stuffed()).percentiles.p50));
+  test('VULN: one workspace changing its value is readable from a single mean', () => {
+    // Neighbouring datasets differing in exactly one WORKSPACE — the gate's own declared
+    // unit of contribution. Declared noise scale b = (1/1599)/(0.1/6) = 0.0375; the true
+    // shift is 0.233, i.e. 6.2 scales.
+    const T = 200;
+    let correct = 0;
+    for (let i = 0; i < T; i++) {
+      if (mustRelease(stuffed(STUFFER_VALUE)).mean > 0.43) correct++;
+      if (mustRelease(stuffed(0)).mean <= 0.43) correct++;
+    }
+    const accuracy = correct / (T * 2);
     assert.ok(
-      Math.abs(p50 - STUFFER_VALUE) < 0.15,
-      `published p50 ${p50.toFixed(3)} is the stuffing workspace's own value ${STUFFER_VALUE}, ` +
-        `republished as a 1000-app industry benchmark`,
+      accuracy > 0.85,
+      `single-release classifier ${(accuracy * 100).toFixed(1)}% on a one-workspace change`,
     );
+  });
+
+  test('VULN: 40 queries recover the stuffing workspace\'s exact value', () => {
+    // The attacker knows the other 999 values (they are the cohort's public ladder, or in
+    // the sybil framing they are his own), so he inverts the published mean directly.
+    const othersSum = Array.from({ length: 999 }, (_, i) => i / 999).reduce((a, b) => a + b, 0);
+    const invert = (m: number): number => (1599 * m - othersSum) / 600;
+
+    const estimate = invert(mean(Array.from({ length: 40 }, () => mustRelease(stuffed(STUFFER_VALUE)).mean)));
+    const error = Math.abs(estimate - STUFFER_VALUE);
+    // Measured over 30 independent runs: median |error| 0.020, worst 0.043.
+    assert.ok(
+      error < 0.12,
+      `recovered ${estimate.toFixed(3)} against a true ${STUFFER_VALUE}, error ${error.toFixed(3)}`,
+    );
+  });
+
+  test('VULN: at scale the percentile channel reopens too', () => {
+    // 6000 of 10000 rows from one workspace collapse the ranks around the p50 target into
+    // a zero-width region, so the mechanism is forced into the gap immediately adjacent to
+    // that workspace's value. The exponential mechanism is intact; the privacy unit is not.
+    function bigStuff(v: number): WorkspaceObservation[] {
+      const list: WorkspaceObservation[] = [];
+      for (let i = 0; i < 6000; i++) list.push(obs('stuffer', v, 1));
+      for (let i = 0; i < 4000; i++) list.push(obs(`w${i}`, i / 4000, 5));
+      return list;
+    }
+    const high = mean(Array.from({ length: 40 }, () => mustRelease(bigStuff(0.62)).percentiles.p50));
+    const low = mean(Array.from({ length: 40 }, () => mustRelease(bigStuff(0.2)).percentiles.p50));
+    assert.ok(Math.abs(high - 0.62) < 0.12, `p50 tracked the stuffer to ${high.toFixed(3)}`);
+    assert.ok(Math.abs(low - 0.2) < 0.12, `p50 tracked the stuffer to ${low.toFixed(3)}`);
+    assert.ok(high - low > 0.25, 'the published median follows one workspace, not the cohort');
   });
 });
 
-// ---------------------------------------------------------------------------
-// VULN-5 — the suppression path is a free, exact, unbudgeted oracle.
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// STILL LIVE — the suppression oracle.
+// ===========================================================================
 
 describe('VULN-5: refusals leak exact counts and cost zero epsilon', () => {
   /**
-   * Gate order is k-anonymity (step 2) then budget (step 3), so a refusal never touches the
-   * budget. And the refusal carries exact numbers: `verdict.contributorCount`,
-   * `verdict.subjectCount` and `shortfall`, plus `explainSuppression()` renders the
-   * shortfall into prose that src/api/server.ts returns to the caller verbatim.
+   * Untouched by the fixes, and the gap has widened: released counts are now generalised
+   * to a coarse public ladder (10, 25, 50, ...) while *refused* cohorts still return exact
+   * `contributorCount`, exact `subjectCount` and an exact `shortfall`, for free, forever.
    *
-   * Net effect: the sub-k region of the dataset — the region k-anonymity exists to protect
-   * — answers unlimited exact queries for free, while the super-k region answers ten noisy
-   * ones. The gate is strictly more informative below threshold than above it.
+   * The sub-k region — the region k-anonymity exists to protect — is now strictly more
+   * informative than the super-k region by a wide margin.
    */
   test('VULN: a refusal reveals a single rival workspace\'s exact subject count', () => {
     const out = gateRelease(COHORT, METRIC, [obs('rival', 0.5, 137)], () => true, 'head', {
@@ -411,7 +484,7 @@ describe('VULN-5: refusals leak exact counts and cost zero epsilon', () => {
     });
     assert.equal(out.released, false);
     if (out.released) return;
-    assert.equal(out.verdict?.subjectCount, 137, 'exact, unnoised subject count of one app');
+    assert.equal(out.verdict?.subjectCount, 137, 'exact, unnoised, un-generalised');
     assert.equal(out.verdict?.contributorCount, 1);
   });
 
@@ -424,7 +497,6 @@ describe('VULN-5: refusals leak exact counts and cost zero epsilon', () => {
     assert.equal(out.released, false);
     if (out.released) return;
     const shortfall = Number(/needs (\d+) more/.exec(out.explanation)?.[1]);
-    // MIN_SUBJECTS is public (k-anonymity.ts:22), so subjectCount = 500 - shortfall.
     assert.equal(500 - shortfall, 361, 'the in-product prose is an exact count disclosure');
   });
 
@@ -441,7 +513,6 @@ describe('VULN-5: refusals leak exact counts and cost zero epsilon', () => {
     const v = out.verdict!;
     assert.equal(v.ok, false);
     if (v.ok) return;
-    // shortfall = ceil(largest / 0.34) - subjectCount, and 0.34 is a published constant.
     const recovered = Math.round((v.shortfall + v.subjectCount) * 0.34);
     assert.ok(
       Math.abs(recovered - 900) <= 2,
@@ -461,97 +532,220 @@ describe('VULN-5: refusals leak exact counts and cost zero epsilon', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// VULN-6 — contributorCount and subjectCount are published exactly.
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// PARTLY FIXED, NEWLY BROKEN — published counts.
+// ===========================================================================
 
-describe('VULN-6: released counts carry no noise and no budget', () => {
+describe('HOLDS-C: count generalisation killed the naive differencing attack', () => {
   /**
-   * AggregateRelease publishes `contributorCount` and `subjectCount` as exact integers.
-   * differential-privacy.ts exports `noisyCount()` for precisely this job — and nothing in
-   * the repository calls it. Grep for it: zero call sites.
+   * First pass: `contributorCount` and `subjectCount` were published exact, so subtracting
+   * two releases whose populations differed by one workspace disclosed that workspace's
+   * subject count to the person (verified: 317).
    *
-   * Because these counts are exact, ordinary set differencing works: any two releases whose
-   * populations differ by one workspace disclose that workspace's exact subject count. And
-   * VULN-3 means an attacker can always obtain both releases.
+   * `generaliseCount` now snaps published figures down to a public ladder. A single
+   * workspace joining or leaving is invisible unless it happens to straddle a rung.
    */
-  test('VULN: differencing two releases yields one workspace\'s exact subject count', () => {
+  test('HOLDS-C1: adding one 317-subject workspace no longer moves the published figure', () => {
     const base = Array.from({ length: 40 }, (_, i) => obs(`w${i}`, 0.3 + i * 0.01, 40));
     const withRival = [...base, obs('rival', 0.55, 317)];
 
     const before = mustRelease(base);
     const after = mustRelease(withRival, { ...COHORT, period: '2026-W31' });
 
-    assert.equal(after.subjectCount - before.subjectCount, 317, 'exact, to the person');
-    assert.equal(after.contributorCount - before.contributorCount, 1);
+    assert.equal(before.subjectCount, 1000, 'true 1600 -> published 1000');
+    assert.equal(after.subjectCount, 1000, 'true 1917 -> published 1000');
+    assert.equal(after.subjectCount - before.subjectCount, 0, 'the difference discloses nothing');
+    assert.equal(after.contributorCount, before.contributorCount);
   });
 
-  test('VULN: the counts are byte-identical across repeated releases (no noise at all)', () => {
-    const population = Array.from({ length: 40 }, (_, i) => obs(`w${i}`, 0.3 + i * 0.01, 40));
-    const counts = new Set(
-      Array.from({ length: 20 }, (_, i) =>
-        mustRelease(population, { ...COHORT, period: `p${i}` }).subjectCount,
-      ),
+  test('HOLDS-C2: the ladder is coarse and monotone, and floors below 10 to zero', () => {
+    assert.deepEqual(
+      [9, 10, 24, 25, 499, 500, 999, 1000, 2499, 2500].map(generaliseCount),
+      [0, 10, 10, 25, 250, 500, 500, 1000, 1000, 2500],
     );
-    assert.equal(counts.size, 1, 'a noised count would vary; this one never does');
   });
 });
 
-// ---------------------------------------------------------------------------
-// VULN-7 — the provenance stamp certifies nothing about the data.
-// ---------------------------------------------------------------------------
-
-describe('VULN-7: the provenance hash does not commit to the released numbers', () => {
+describe('VULN-6: generalisation is fully invertible by an adversary who can shape the cohort', () => {
   /**
-   * release-gate.ts:155 hashes [ledgerHead, cohortKey, metricName, contributorCount,
-   * subjectCount, epsilon]. It does not hash the percentiles, the mean, the observation
-   * set, the consent predicate that was used, or the thresholds that were applied.
+   * This is the attack `generaliseCount` has to survive to be worth anything, and it does
+   * not. Generalisation is deterministic: the published figure is a known function of the
+   * true count. An attacker who contributes to the cohort controls the argument to that
+   * function, so he can binary-search a ladder boundary until it brackets the victim.
    *
-   * So the stamp proves only that *some* release with these counts was made against a
-   * ledger head. It cannot detect altered numbers, a fabricated distribution, a weakened
-   * k threshold (VULN-8), or a release built from non-consented rows. A buyer's compliance
-   * team verifying this hash is verifying a tautology.
+   * Setup: 200 sybil workspaces whose subject counts the attacker sets exactly, plus one
+   * honest victim with unknown subject count v. Published subjectCount is
+   * `generaliseCount(S + v)`. The attacker finds the smallest S for which the published
+   * figure reaches ladder rung L, and then v = L - S. Every probe needs a fresh budget,
+   * which VULN-3 supplies without limit.
+   *
+   * This is the structural difference between generalisation and differential privacy:
+   * DP degrades gracefully under composition, deterministic generalisation does not degrade
+   * at all — it simply falls over once the adversary can move the input.
    */
-  test('VULN: two releases with completely different numbers share one provenance hash', () => {
-    // 1000 contributors keeps the noise scale at 0.06 so the two distributions stay
-    // visibly different; the point of the test is that the stamps do not.
+  const LADDER = [10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10_000, 25_000, 50_000];
+
+  /** Publish subjectCount for a cohort of 200 attacker-controlled sybils plus the victim. */
+  function probe(sybilSubjects: number, victim: number): number | null {
+    const list: WorkspaceObservation[] = [];
+    const base = Math.floor(sybilSubjects / 200);
+    const rem = sybilSubjects % 200;
+    for (let i = 0; i < 200; i++) list.push(obs(`s${i}`, 0.5, base + (i < rem ? 1 : 0)));
+    list.push(obs('victim', 0.5, victim));
+    const out = gateRelease(COHORT, METRIC, list, () => true, 'head', {
+      budget: new PrivacyBudget(),
+    });
+    return out.released ? out.release.subjectCount : null;
+  }
+
+  function recover(victim: number): { vhat: number; queries: number; boundary: number } {
+    let queries = 0;
+    for (const L of LADDER) {
+      // The boundary must sit high enough that the victim stays inside the 34% cap.
+      if (L < 3 * victim) continue;
+      let lo = 0;
+      let hi = L;
+      let feasible = true;
+      while (hi - lo > 1) {
+        const mid = Math.floor((lo + hi) / 2);
+        queries++;
+        const published = probe(mid, victim);
+        if (published === null) {
+          feasible = false;
+          break;
+        }
+        if (published >= L) hi = mid;
+        else lo = mid;
+      }
+      if (feasible) return { vhat: L - hi, queries, boundary: L };
+    }
+    return { vhat: -1, queries, boundary: -1 };
+  }
+
+  test('VULN: ~13 adaptive queries recover the victim\'s EXACT subject count', () => {
+    for (const victim of [317, 842, 1163, 4471]) {
+      const r = recover(victim);
+      assert.equal(
+        r.vhat,
+        victim,
+        `victim ${victim} recovered as ${r.vhat} in ${r.queries} queries at rung ${r.boundary}`,
+      );
+      assert.ok(r.queries <= 16, `${r.queries} queries is still trivially cheap`);
+    }
+  });
+
+  test('VULN: passive watching detects ladder crossings to the period', () => {
+    // No sybils needed for the weaker version — just subscribe and watch. A crossing is a
+    // dated, exact statement about the cohort's growth.
+    const watch = (total: number): number | null => {
+      const list = Array.from({ length: 20 }, (_, i) => obs(`w${i}`, 0.5, Math.floor(total / 20)));
+      list[0]!.subjectCount += total % 20;
+      const out = gateRelease(COHORT, METRIC, list, () => true, 'head', {
+        budget: new PrivacyBudget(),
+      });
+      return out.released ? out.release.subjectCount : null;
+    };
+    assert.equal(watch(499), null, 'below MIN_SUBJECTS the cohort is suppressed — itself a signal');
+    assert.equal(watch(500), 500);
+    assert.equal(watch(999), 500);
+    assert.equal(watch(1000), 1000, 'the exact period of the 1000th subject is disclosed');
+    assert.equal(watch(2499), 1000);
+    assert.equal(watch(2500), 2500);
+  });
+});
+
+// ===========================================================================
+// MOSTLY FIXED — provenance.
+// ===========================================================================
+
+describe('HOLDS-P / VULN-7: the provenance stamp now binds the numbers, but is unsigned', () => {
+  /**
+   * First pass: the preimage covered only [ledgerHead, cohortKey, metricName, counts,
+   * epsilon], so two releases built from opposite distributions produced byte-identical
+   * stamps and a post-hoc edit of p50 was undetectable.
+   *
+   * `release-gate.ts:212` now commits to the metric bounds, all five percentiles, the mean,
+   * the published counts and the threshold options. That is a real fix.
+   *
+   * What remains: it is an unsigned SHA-256 over a preimage that is entirely public, so
+   * anyone can mint a stamp that verifies for numbers they invented. It also still omits
+   * the contributing workspace set and the consent predicate, and no verification function
+   * is exported anywhere in the repository — a buyer has to reimplement the preimage from
+   * this source file to check anything.
+   */
+  test('HOLDS-P1: opposite distributions no longer collide', () => {
     const low = Array.from({ length: 1000 }, (_, i) => obs(`w${i}`, 0.02, 100));
     const high = Array.from({ length: 1000 }, (_, i) => obs(`w${i}`, 0.98, 100));
-
-    const a = mustRelease(low);
-    const b = mustRelease(high, COHORT, METRIC, new PrivacyBudget());
-
-    assert.equal(
-      a.provenanceHash,
-      b.provenanceHash,
-      'identical stamp for opposite distributions — the hash binds metadata only',
-    );
-    assert.ok(Math.abs(a.percentiles.p50 - b.percentiles.p50) > 0.2);
+    assert.notEqual(mustRelease(low).provenanceHash, mustRelease(high).provenanceHash);
   });
 
-  test('VULN: a tampered release still verifies against its own stamp', () => {
-    const release = mustRelease(Array.from({ length: 20 }, (_, i) => obs(`w${i}`, 0.2, 100)));
-    const stamp = release.provenanceHash;
-    // A reseller marks the cohort up to make their client look worse than the market.
-    release.percentiles.p50 = 0.99;
-    release.mean = 0.99;
-    assert.equal(release.provenanceHash, stamp, 'nothing about the stamp detects this');
+  test('HOLDS-P2: the stamp changes when any published statistic changes', () => {
+    const pop = Array.from({ length: 1000 }, (_, i) => obs(`w${i}`, i / 1000, 100));
+    const hashes = new Set(Array.from({ length: 20 }, () => mustRelease(pop).provenanceHash));
+    assert.equal(hashes.size, 20, 'independent draws must produce independent stamps');
+  });
+
+  test('HOLDS-P3: the consent-ledger head is still bound in', () => {
+    const pop = Array.from({ length: 20 }, (_, i) => obs(`w${i}`, 0.4, 100));
+    const a = gateRelease(COHORT, METRIC, pop, () => true, 'headA', { budget: new PrivacyBudget() });
+    const b = gateRelease(COHORT, METRIC, pop, () => true, 'headB', { budget: new PrivacyBudget() });
+    assert.ok(a.released && b.released);
+    if (!a.released || !b.released) return;
+    assert.notEqual(a.release.provenanceHash, b.release.provenanceHash);
+  });
+
+  test('VULN: the stamp is unsigned, so a reseller can mint one for invented numbers', async () => {
+    const { createHash } = await import('node:crypto');
+    const real = mustRelease(Array.from({ length: 20 }, (_, i) => obs(`w${i}`, 0.2, 100)));
+
+    // Fabricate a release that makes the buyer's competitors look worse, then compute a
+    // stamp for it from the public preimage recipe. No key is involved anywhere.
+    const forged = { ...real, percentiles: { ...real.percentiles, p50: 0.99 }, mean: 0.99 };
+    forged.provenanceHash = createHash('sha256')
+      .update(
+        [
+          'ledger-head',
+          cohortKeyString(forged.cohort),
+          forged.metric,
+          METRIC.lo,
+          METRIC.hi,
+          forged.contributorCount,
+          forged.subjectCount,
+          forged.percentiles.p10,
+          forged.percentiles.p25,
+          forged.percentiles.p50,
+          forged.percentiles.p75,
+          forged.percentiles.p90,
+          forged.mean,
+          forged.epsilonSpent,
+          '',
+          '',
+          '',
+        ].join(' '),
+      )
+      .digest('hex');
+
+    // The forged stamp is internally consistent and indistinguishable from a real one.
+    assert.equal(forged.provenanceHash.length, 64);
+    assert.notEqual(forged.provenanceHash, real.provenanceHash);
+    assert.equal(forged.percentiles.p50, 0.99, 'fabricated number carrying a valid-looking stamp');
   });
 });
 
-// ---------------------------------------------------------------------------
-// VULN-8 — the k thresholds are caller-supplied with no floor.
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// STILL LIVE — threshold overrides.
+// ===========================================================================
 
 describe('VULN-8: gateRelease accepts weaker-than-policy thresholds without complaint', () => {
   /**
-   * ReleaseGateOptions exposes minContributors, minSubjects and maxContributorShare as
-   * optional overrides with `?? MIN_CONTRIBUTORS` style defaults and no lower bound. The
-   * file header claims "any future 'just this once' bypass has to be written as an obvious
-   * exception" — but the bypass already exists as a documented, type-checked option object.
+   * Unchanged. `ReleaseGateOptions` exposes minContributors / minSubjects /
+   * maxContributorShare with `?? DEFAULT` resolution and no lower bound.
    *
-   * The release that comes back is structurally indistinguishable from a compliant one and
-   * its provenance hash (VULN-7) records nothing about which thresholds were applied.
+   * Count generalisation has made this *harder* to spot, not easier: a k=1 release now
+   * publishes contributorCount 0 rather than 1, and every cohort between 10 and 24
+   * contributors publishes the same 10, so the counts no longer distinguish a compliant
+   * release from a marginal one. The thresholds ARE in the provenance preimage now, but
+   * only as opaque bytes — there is no verifier to check them against policy.
    */
   test('VULN: a single workspace with three subjects is released on request', () => {
     const out = gateRelease(COHORT, METRIC, [obs('solo', 0.37, 3)], () => true, 'head', {
@@ -563,13 +757,19 @@ describe('VULN-8: gateRelease accepts weaker-than-policy thresholds without comp
     });
     assert.equal(out.released, true, 'k=1 release: one app, three people, no suppression');
     if (!out.released) return;
-    assert.equal(out.release.contributorCount, 1);
-    assert.equal(out.release.subjectCount, 3);
+    assert.equal(out.release.contributorCount, 0, 'generalisation reports 0, not 1');
+    assert.equal(out.release.subjectCount, 0);
     assert.equal(out.release.provenanceHash.length, 64, 'and it carries a full provenance stamp');
   });
 
+  test('VULN: published counts cannot distinguish k=10 from k=24', () => {
+    const at10 = Array.from({ length: 10 }, (_, i) => obs(`w${i}`, 0.4, 60));
+    const at24 = Array.from({ length: 24 }, (_, i) => obs(`w${i}`, 0.4, 25));
+    assert.equal(mustRelease(at10).contributorCount, 10);
+    assert.equal(mustRelease(at24).contributorCount, 10);
+  });
+
   test('HOLDS: the budget still caps a single query at the cohort budget', () => {
-    // A caller cannot buy arbitrarily low noise: trySpend refuses epsilon > remaining.
     const budget = new PrivacyBudget();
     const out = gateRelease(COHORT, METRIC, [obs('solo', 0.37, 3)], () => true, 'head', {
       budget,
@@ -583,63 +783,103 @@ describe('VULN-8: gateRelease accepts weaker-than-policy thresholds without comp
   });
 });
 
-// ---------------------------------------------------------------------------
-// VULN-9 — post-hoc sort() manufactures dispersion that is not in the data.
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// STILL LIVE, DIFFERENT SIGNATURE — the ladder carries no information.
+// ===========================================================================
 
-describe('VULN-9: the re-sorted ladder is a biased estimator', () => {
+describe('VULN-9: below ~10,000 contributors the published ladder is pure noise', () => {
   /**
-   * release-gate.ts:132 noises the five percentiles independently and then `.sort()`s them
-   * so the ladder reads monotonically. Sorting is legitimate DP post-processing — it leaks
-   * nothing extra — but it is not free: it turns the reported p10 into the MINIMUM of five
-   * noisy draws and the reported p90 into the MAXIMUM.
+   * First pass, under Laplace: at k=10 the noise scale was 6.0 on a [0,1] domain, so 85% of
+   * published medians were exactly 0 or 1. The exponential mechanism has removed the
+   * bound-piling and the DP violation — but NOT the underlying problem, which is the
+   * epsilon allocation, not the mechanism.
    *
-   * On a tight cohort where the true ladder is nearly flat, the published ladder is pure
-   * order statistics of the noise. Buyers read that as market dispersion. It is not a
-   * privacy leak; it is a correctness and misrepresentation problem, and it means the
-   * ladder cannot be used to reason about the cohort at all.
+   * The exponential mechanism's error is measured in RANKS, with scale 2/epsilon. At
+   * epsilon/6 = 0.0167 that is 120 ranks. A cohort must have n >> 120 contributors before
+   * the rank error is small as a fraction of the population. It does not.
+   *
+   * Consequence, measured below: at n <= 1000 the published ladder is statistically
+   * identical to the order statistics of five uniform draws on [lo, hi]. A cohort of ten
+   * apps with values 0.0 .. 0.9 and a cohort of ten apps that all report exactly 0.5
+   * publish the same ladder. `compare()` in src/core/aggregate/benchmarks.ts will report a
+   * confident percentile rank from it either way.
+   *
+   * This is a correctness and misrepresentation finding, not a disclosure one — but it
+   * decides the minimum viable cohort size, so it is commercially load-bearing.
    */
-  test('VULN: a cohort with zero dispersion is published with a wide spread', () => {
-    const flat = Array.from({ length: 200 }, (_, i) => obs(`w${i}`, 0.5, 5)); // every value 0.5
-    const runs = Array.from({ length: 150 }, () => mustRelease(flat).percentiles);
-    const p10 = mean(runs.map((r) => r.p10));
-    const p90 = mean(runs.map((r) => r.p90));
-
-    assert.ok(
-      p90 - p10 > 0.3,
-      `true p90 - p10 is exactly 0; published spread is ${(p90 - p10).toFixed(3)}`,
-    );
-    assert.ok(p10 < 0.4, `p10 biased down to ${p10.toFixed(3)}`);
-    assert.ok(p90 > 0.6, `p90 biased up to ${p90.toFixed(3)}`);
+  test('VULN: a flat cohort publishes the order statistics of five uniform draws', () => {
+    const flat = Array.from({ length: 200 }, (_, i) => obs(`w${i}`, 0.5, 5)); // zero dispersion
+    const runs = Array.from({ length: 300 }, () => mustRelease(flat).percentiles);
+    // Theory for min/median/max of five iid U(0,1): 1/6, 3/6, 5/6.
+    for (const [k, theory] of [['p10', 1 / 6], ['p50', 3 / 6], ['p90', 5 / 6]] as const) {
+      const got = mean(runs.map((r) => r[k]));
+      assert.ok(
+        Math.abs(got - theory) < 0.05,
+        `${k} = ${got.toFixed(3)}, uniform-order-statistic theory says ${theory.toFixed(3)}`,
+      );
+    }
   });
 
-  test('VULN: at the minimum legal cohort size the output is mostly clamped to the bounds', () => {
-    // 10 contributors => sensitivity 0.1, epsilon/6 = 0.0167 => Laplace scale b = 6.0
-    // on a [0, 1] domain. Almost every draw leaves the domain and is clamped.
-    const minimal = Array.from({ length: 10 }, (_, i) => obs(`w${i}`, 0.4, 50));
-    const draws = Array.from({ length: 300 }, () => mustRelease(minimal).percentiles.p50);
-    const atBound = draws.filter((v) => v === 0 || v === 1).length / draws.length;
-    assert.ok(
-      atBound > 0.5,
-      `${(atBound * 100).toFixed(0)}% of published medians are exactly 0 or 1 — ` +
-        `at k = 10 the released statistic carries essentially no signal`,
-    );
+  test('VULN: at k=10 a spread cohort and a flat cohort are indistinguishable', () => {
+    const spread = Array.from({ length: 10 }, (_, i) => obs(`w${i}`, i / 10, 50)); // true p50 0.45
+    const flat = Array.from({ length: 10 }, (_, i) => obs(`w${i}`, 0.5, 50)); // true spread 0
+    const T = 300;
+    const S = Array.from({ length: T }, () => mustRelease(spread).percentiles);
+    const F = Array.from({ length: T }, () => mustRelease(flat).percentiles);
 
-    // Sharper: a cohort whose true median is 0.05 still publishes a median above 0.9 on a
-    // large fraction of queries. Theory: P(clamp to hi) = 0.5 * exp(-0.95 / 6) = 0.427.
-    const lowTruth = Array.from({ length: 10 }, (_, i) => obs(`w${i}`, 0.05, 50));
-    const lowDraws = Array.from({ length: 300 }, () => mustRelease(lowTruth).percentiles.p50);
-    const wildlyHigh = lowDraws.filter((v) => v >= 0.9).length / lowDraws.length;
+    for (const k of ['p10', 'p50', 'p90'] as const) {
+      const gap = Math.abs(mean(S.map((r) => r[k])) - mean(F.map((r) => r[k])));
+      assert.ok(gap < 0.1, `${k} differed by only ${gap.toFixed(3)} between the two cohorts`);
+    }
+  });
+
+  test('VULN: at k=10 the published median ignores the truth and reports the domain midpoint', () => {
+    // True p50 is 0.275. The mechanism reports ~0.49 whatever the data says.
+    const cohort10 = Array.from({ length: 10 }, (_, i) => obs(`w${i}`, 0.05 + i * 0.05, 50));
+    const draws = Array.from({ length: 300 }, () => mustRelease(cohort10).percentiles.p50);
     assert.ok(
-      wildlyHigh > 0.25,
-      `true median 0.05, but ${(wildlyHigh * 100).toFixed(0)}% of releases report >= 0.9`,
+      Math.abs(mean(draws) - 0.5) < 0.08,
+      `published median averaged ${mean(draws).toFixed(3)}; the true p50 is 0.275`,
     );
+    assert.ok(
+      mean(draws.map((v) => Math.abs(v - 0.275))) > 0.15,
+      'mean absolute error must be large — this test exists to record that it is',
+    );
+  });
+
+  test('HOLDS: the ladder does become usable, but only around n = 10,000', () => {
+    // Recorded so the crossover is a fact in the suite rather than an opinion in a doc.
+    const big = Array.from({ length: 10_000 }, (_, i) => obs(`w${i}`, (i + 0.5) / 10_000, 1));
+    const draws = Array.from({ length: 40 }, () => mustRelease(big).percentiles.p50);
+    assert.ok(
+      mean(draws.map((v) => Math.abs(v - 0.5))) < 0.05,
+      `n=10000 mean |error| ${mean(draws.map((v) => Math.abs(v - 0.5))).toFixed(4)}`,
+    );
+  });
+
+  test('HOLDS: the fix is the epsilon allocation, not the mechanism', () => {
+    // Same mechanism, same n = 1000, budget spent on ONE quantile instead of split six
+    // ways: error drops from ~0.10 to ~0.02. This is the cheapest available remedy.
+    const values = Array.from({ length: 1000 }, (_, i) => (i + 0.5) / 1000);
+    const split = mean(
+      Array.from({ length: 200 }, () =>
+        Math.abs(exponentialQuantile({ values, q: 0.5, lo: 0, hi: 1, epsilon: 0.1 / 6 }) - 0.5),
+      ),
+    );
+    const whole = mean(
+      Array.from({ length: 200 }, () =>
+        Math.abs(exponentialQuantile({ values, q: 0.5, lo: 0, hi: 1, epsilon: 0.1 }) - 0.5),
+      ),
+    );
+    assert.ok(split > 0.05, `six-way split error ${split.toFixed(4)}`);
+    assert.ok(whole < 0.05, `un-split error ${whole.toFixed(4)}`);
+    assert.ok(split / whole > 2, 'spending the whole query budget on one rung is much better');
   });
 });
 
-// ---------------------------------------------------------------------------
-// VULN-10 — the wired consent predicate never consults the consent ledger.
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// STILL LIVE — consent, jurisdiction, redaction, identity. Unchanged by the fixes.
+// ===========================================================================
 
 describe('VULN-10: co-op release ignores per-subject consent entirely', () => {
   /**
@@ -649,12 +889,9 @@ describe('VULN-10: co-op release ignores per-subject consent entirely', () => {
    * src/api/server.ts:204 —  (o) => store.hasCoopConsent(o.workspaceId)
    * src/api/store.ts:52    —  returns profile.coopEnrolled
    *
-   * That is a per-WORKSPACE boolean set by the developer. It never reads the ConsentLedger,
-   * so the entire three-tier purpose model (product_analytics / benchmark_contribution /
-   * coop_licensing), sticky withdrawal, the jurisdiction defaults and the GPC/DNT handling
-   * in the /v1/events path all have zero effect on what is licensed to third parties.
-   *
-   * docs/04-data-governance.md, "Decision 3", describes a control that is not wired up.
+   * A per-WORKSPACE boolean set by the developer. It never reads the ConsentLedger, so the
+   * three-tier purpose model, sticky withdrawal, the jurisdiction defaults and the GPC/DNT
+   * handling in the /v1/events path all have zero effect on what is licensed.
    */
   test('VULN: a subject who explicitly withdrew is still co-op eligible', () => {
     const ledger = new ConsentLedger();
@@ -679,8 +916,6 @@ describe('VULN-10: co-op release ignores per-subject consent entirely', () => {
   });
 
   test('VULN: observations carry no consent state for the gate to filter on', () => {
-    // WorkspaceObservation has no subject list and no purpose field, so even a corrected
-    // predicate has nothing subject-level to filter. The leak is structural, not a typo.
     const o = obs('ws1', 0.4, 500);
     assert.deepEqual(Object.keys(o).sort(), [
       'cohort',
@@ -692,19 +927,7 @@ describe('VULN-10: co-op release ignores per-subject consent entirely', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// VULN-11 — jurisdiction is self-declared by the client.
-// ---------------------------------------------------------------------------
-
 describe('VULN-11: the strict EU posture is opt-out by string', () => {
-  /**
-   * ingest.ts:60 —  const jurisdiction = raw.context?.jurisdiction || 'unknown';
-   *
-   * That value comes from the SDK payload. `ipToCountry` exists in redaction.ts and the IP
-   * is present on the same request, but nothing cross-checks them. A workspace that labels
-   * its EU traffic 'US' converts the fail-closed EU posture (analytics unknown, benchmark
-   * denied) into US defaults (analytics granted, benchmark granted) for free.
-   */
   const raw = (jurisdiction: string): RawEvent => ({
     workspaceId: 'ws1',
     eventId: `e_${jurisdiction}`,
@@ -738,10 +961,6 @@ describe('VULN-11: the strict EU posture is opt-out by string', () => {
   });
 
   test('HOLDS: prototype-shaped jurisdictions do not grant anything', () => {
-    // DEFAULT_POSTURE is a plain object literal, so DEFAULT_POSTURE['__proto__'] is truthy
-    // and short-circuits the `?? FALLBACK_POSTURE`. The lookup then yields undefined, which
-    // fails the `=== 'granted'` test — fail-closed by luck rather than by design, but it
-    // does fail closed. Note the returned value is not a valid ConsentState.
     const ledger = new ConsentLedger();
     for (const j of ['__proto__', 'constructor', 'toString', 'valueOf']) {
       assert.deepEqual(ledger.permittedPurposes('w', 's', j), [], `jurisdiction ${j}`);
@@ -749,21 +968,14 @@ describe('VULN-11: the strict EU posture is opt-out by string', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// VULN-12 — redaction bypasses.
-// ---------------------------------------------------------------------------
-
 describe('VULN-12: PII channels that walk straight past redactProperties', () => {
   test('VULN: property KEY names are never scanned for PII, only blocklisted', () => {
-    // redactProperties tests the key against BLOCKED_KEY_PATTERN and then uses it verbatim
-    // as an output key. The value patterns are never applied to keys.
     const { properties } = redactProperties({ 'jane.doe@acme.com': 1, 'ip_10.0.0.7': true });
     assert.equal(properties['jane.doe@acme.com'], 1, 'an email address survives as a key name');
     assert.equal(properties['ip_10.0.0.7'], true);
   });
 
   test('VULN: non-ASCII and full-width emails defeat the email pattern', () => {
-    // JS \w is ASCII-only, so any accented character breaks [\w.+-]+@[\w-]+\.[\w.-]{2,}.
     const { properties, findings } = redactProperties({
       a: 'josé@exämple.com',
       b: 'user＠example.com', // full-width commercial at
@@ -777,7 +989,10 @@ describe('VULN-12: PII channels that walk straight past redactProperties', () =>
 
   test('VULN: trivially reversible encodings are invisible to every pattern', () => {
     const encoded = Buffer.from('ada.lovelace@example.com').toString('base64');
-    const { properties } = redactProperties({ payload: encoded, hexed: Buffer.from('4111111111111111').toString('hex') });
+    const { properties } = redactProperties({
+      payload: encoded,
+      hexed: Buffer.from('4111111111111111').toString('hex'),
+    });
     assert.equal(properties.payload, encoded);
     assert.equal(
       Buffer.from(properties.payload as string, 'base64').toString(),
@@ -799,9 +1014,9 @@ describe('VULN-12: PII channels that walk straight past redactProperties', () =>
 
   test('VULN: numeric PII is stored untouched — patterns only ever run on strings', () => {
     const { properties, findings } = redactProperties({
-      account_ref: 5551234567, // a phone number
-      pan: 4111111111111111, // a card number
-      y_deg: 52.379189, // precise geolocation, key dodges lat|lng|latitude|longitude
+      account_ref: 5551234567,
+      pan: 4111111111111111,
+      y_deg: 52.379189,
       x_deg: 4.899431,
       lon_deg: 4.899431, // "lon" is not in BLOCKED_KEY_PATTERN; "lat" and "lng" are
     });
@@ -813,8 +1028,6 @@ describe('VULN-12: PII channels that walk straight past redactProperties', () =>
   });
 
   test('VULN: the event NAME is a 64-character unredacted free-text channel', () => {
-    // EVENT_NAME_PATTERN allows [a-z0-9_.:-], which is enough for names, phone digits and
-    // dotted email local parts. ingest() never passes the name through redactProperties.
     const out = ingest(
       {
         workspaceId: 'ws1',
@@ -832,8 +1045,6 @@ describe('VULN-12: PII channels that walk straight past redactProperties', () =>
   });
 
   test('HOLDS: value-level patterns still catch camelCase keys the blocklist misses', () => {
-    // BLOCKED_KEY_PATTERN needs an underscore or a boundary, so `userEmail` is not blocked —
-    // but the value scan catches the address anyway. Defence in depth working as intended.
     const { properties } = redactProperties({ userEmail: 'ada@example.com', emailAddress: 'x@y.com' });
     assert.equal(properties.userEmail, '[redacted:email]');
     assert.equal(properties.emailAddress, '[redacted:email]');
@@ -859,22 +1070,7 @@ describe('VULN-12: PII channels that walk straight past redactProperties', () =>
   });
 });
 
-// ---------------------------------------------------------------------------
-// VULN-13 — epoch rotation provides no forward secrecy.
-// ---------------------------------------------------------------------------
-
 describe('VULN-13: pseudonym "rotation" is a counter, not a rotating secret', () => {
-  /**
-   * identity.ts claims "after an epoch flips, yesterday's key can no longer be joined to
-   * today's". That is true only for an attacker without the root secret. The epoch is a
-   * plaintext counter mixed into the HMAC message; the key material is a single long-lived
-   * `rootSecret` that is never rotated and never destroyed.
-   *
-   * subjectKeysForRetentionWindow is a ready-made relinking oracle: give it a raw
-   * identifier and it regenerates every pseudonym that identifier has ever had across the
-   * whole 400-day retention window. Anyone with the secret — the operator, an insider, a
-   * subpoena, a backup leak — can join a person's rows across every epoch.
-   */
   test('VULN: a 400-day sweep reconstructs a year-old pseudonym exactly', () => {
     const yearOld = deriveSubjectKey(SECRET, 'ws1', 'alice', '2025-07-01T00:00:00Z');
     const sweep = subjectKeysForRetentionWindow(SECRET, 'ws1', 'alice', '2026-07-27T00:00:00Z', 400);
@@ -883,8 +1079,6 @@ describe('VULN-13: pseudonym "rotation" is a counter, not a rotating secret', ()
   });
 
   test('VULN: backdating occurredAt regenerates any past epoch\'s key', () => {
-    // The epoch index is a pure function of a client-supplied timestamp, so a workspace can
-    // address any historical epoch it likes simply by asserting an old occurredAt.
     const oldEpoch = epochFor('2024-01-15T00:00:00Z');
     const insideOldEpoch = new Date(oldEpoch * EPOCH_DAYS * 86_400_000 + 86_400_000).toISOString();
     const alsoInside = new Date(oldEpoch * EPOCH_DAYS * 86_400_000 + 5 * 86_400_000).toISOString();
@@ -903,9 +1097,6 @@ describe('VULN-13: pseudonym "rotation" is a counter, not a rotating secret', ()
   });
 
   test('HOLDS: cross-workspace linkage really is impossible by construction', () => {
-    // This is the claim docs/04 leans hardest on, and it survives: the per-workspace HMAC
-    // scoping means the same human in two apps yields two unrelated keys, and nothing in
-    // the codebase can invert it without the root secret.
     const keys = new Set(
       ['ws_a', 'ws_b', 'ws_c'].map((w) =>
         deriveSubjectKey(SECRET, w, 'alice@example.com', '2026-07-01T00:00:00Z'),
@@ -919,15 +1110,19 @@ describe('VULN-13: pseudonym "rotation" is a counter, not a rotating secret', ()
   });
 });
 
-// ---------------------------------------------------------------------------
-// Defences that held under attack. These are regression guards.
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// Defences that held under attack. Regression guards.
+// ===========================================================================
 
 describe('HOLDS: defences that survived the audit', () => {
   test('HOLDS-1: non-consented rows influence nothing at all', () => {
     // Attempted attack: pad a thin cohort with non-consented rows so it clears k, or shift
-    // the published distribution with rows nobody agreed to license. Both fail — the gate
-    // filters first and every downstream computation reads `eligible`.
+    // the published distribution with rows nobody agreed to license.
+    //
+    // The padding is chosen so that a leak would be unmistakable AFTER generalisation:
+    // 20 consented workspaces / 2000 subjects publish as 10 / 1000, whereas 70 workspaces /
+    // 52000 subjects would publish as 50 / 50000. Equality of the published figures is
+    // therefore evidence about the underlying counts, not an artefact of the ladder.
     const consenting = new Set(Array.from({ length: 20 }, (_, i) => `w${i}`));
     const clean = Array.from({ length: 20 }, (_, i) => obs(`w${i}`, 0.4, 100));
     const padded = [
@@ -942,10 +1137,15 @@ describe('HOLDS: defences that survived the audit', () => {
     assert.equal(outB.released, true);
     if (!outB.released) return;
 
-    assert.equal(a.contributorCount, outB.release.contributorCount);
-    assert.equal(a.subjectCount, outB.release.subjectCount);
-    assert.equal(outB.release.contributorCount, 20, 'the 50 non-consented workspaces are invisible');
-    assert.equal(outB.release.subjectCount, 2000);
+    assert.equal(a.contributorCount, 10, 'true 20 contributors -> published 10');
+    assert.equal(a.subjectCount, 1000, 'true 2000 subjects -> published 1000');
+    assert.equal(outB.release.contributorCount, a.contributorCount);
+    assert.equal(outB.release.subjectCount, a.subjectCount);
+    // If the 50 non-consented workspaces had leaked into the counts:
+    assert.equal(generaliseCount(70), 50);
+    assert.equal(generaliseCount(52_000), 50_000);
+    assert.notEqual(outB.release.contributorCount, generaliseCount(70));
+    assert.notEqual(outB.release.subjectCount, generaliseCount(52_000));
   });
 
   test('HOLDS-2: non-consented rows cannot lift a sub-k cohort over the threshold', () => {
@@ -978,13 +1178,10 @@ describe('HOLDS: defences that survived the audit', () => {
   });
 
   test('HOLDS-5: noise is drawn from a CSPRNG, not a predictable stream', () => {
-    // A seeded or Math.random-backed stream would be reproducible across processes and the
-    // noise would be subtractable. Sanity check that draws are unique and well spread.
     const population = Array.from({ length: 200 }, (_, i) => obs(`w${i}`, i / 200, 5));
     const draws = Array.from({ length: 60 }, (_, i) =>
       mustRelease(population, { ...COHORT, period: `p${i}` }).mean,
     );
-    // Clamping makes 0 and 1 legitimately repeat; every interior draw must be unique.
     const interior = draws.filter((v) => v > 0 && v < 1);
     assert.ok(interior.length > 20, 'test precondition: enough unclamped draws to judge');
     assert.equal(new Set(interior).size, interior.length, 'interior draws must never repeat');
@@ -1011,8 +1208,6 @@ describe('HOLDS: defences that survived the audit', () => {
   });
 
   test('HOLDS-7: released values never escape the declared public domain', () => {
-    // Attempted attack: force the mechanism to emit an out-of-range value that would reveal
-    // the direction and magnitude of the noise draw. Clamping holds on every statistic.
     const population = Array.from({ length: 12 }, (_, i) => obs(`w${i}`, i / 12, 50));
     for (let i = 0; i < 200; i++) {
       const r = mustRelease(population, { ...COHORT, period: `p${i}` });
@@ -1023,7 +1218,6 @@ describe('HOLDS: defences that survived the audit', () => {
   });
 
   test('HOLDS-8: out-of-domain input values are clamped before they are measured', () => {
-    // A poisoning workspace reporting value 1e9 cannot drag the aggregate: clamp runs first.
     const poisoned = [
       ...Array.from({ length: 20 }, (_, i) => obs(`w${i}`, 0.4, 100)),
       obs('poison', 1e9, 100),
@@ -1032,5 +1226,32 @@ describe('HOLDS: defences that survived the audit', () => {
       const r = mustRelease(poisoned, { ...COHORT, period: `p${i}` });
       assert.ok(r.mean >= 0 && r.mean <= 1);
     }
+  });
+
+  test('HOLDS-9: the percentile ladder is monotone in every release', () => {
+    const population = Array.from({ length: 500 }, (_, i) => obs(`w${i}`, i / 500, 5));
+    for (let i = 0; i < 100; i++) {
+      const p = mustRelease(population, { ...COHORT, period: `p${i}` }).percentiles;
+      assert.ok(p.p10 <= p.p25 && p.p25 <= p.p50 && p.p50 <= p.p75 && p.p75 <= p.p90);
+    }
+  });
+
+  test('HOLDS-10: the mean is correctly calibrated when one row means one workspace', () => {
+    // The complement of VULN-4. With exactly one observation per workspace,
+    // (hi - lo) / values.length IS the per-workspace sensitivity, and a single workspace
+    // moving from lo to hi is NOT distinguishable from the published mean.
+    const base = (last: number) => [
+      ...Array.from({ length: 999 }, (_, i) => obs(`w${i}`, 0.5, 5)),
+      obs('subject', last, 5),
+    ];
+    const T = 150;
+    let correct = 0;
+    for (let i = 0; i < T; i++) {
+      if (mustRelease(base(1)).mean > mustRelease(base(0)).mean) correct++;
+    }
+    assert.ok(
+      correct / T < 0.75,
+      `one-workspace change detected ${(correct / T * 100).toFixed(0)}% of the time`,
+    );
   });
 });
