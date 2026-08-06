@@ -20,7 +20,8 @@
     "db:studio": "prisma studio",
     "db:seed": "tsx prisma/seed.ts",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "start:migrate": "prisma migrate deploy && tsx server/index.ts"
   },
   "prisma": {
     "seed": "tsx prisma/seed.ts"
@@ -29,10 +30,12 @@
     "@anthropic-ai/sdk": "^0.115.0",
     "@prisma/client": "^6.16.2",
     "next": "^15.5.4",
+    "prisma": "^6.16.2",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
     "socket.io": "^4.8.1",
     "socket.io-client": "^4.8.1",
+    "tsx": "^4.20.3",
     "zod": "^3.25.76"
   },
   "devDependencies": {
@@ -40,9 +43,7 @@
     "@types/node": "^22.15.3",
     "@types/react": "^19.1.9",
     "@types/react-dom": "^19.1.7",
-    "prisma": "^6.16.2",
     "tailwindcss": "^4.1.13",
-    "tsx": "^4.20.3",
     "typescript": "^5.9.2",
     "vitest": "^3.2.4"
   }

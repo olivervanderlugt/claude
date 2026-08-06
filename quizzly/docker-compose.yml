@@ -52,10 +52,9 @@ services:
       - "${PORT:-3000}:3000"
     # Apply migrations before serving. `migrate deploy` only ever applies
     # already-committed migrations — it never generates or resets anything, so
-    # it is safe to run automatically on every boot.
-    command: >
-      sh -c "node_modules/.bin/prisma migrate deploy &&
-             node_modules/.bin/tsx server/index.ts"
+    # it is safe to run on every boot. Uses the npm script so node_modules/.bin
+    # is on PATH; hard-coded binary paths broke when the image layout changed.
+    command: npm run start:migrate
 
 volumes:
   postgres-data:

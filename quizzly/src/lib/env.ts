@@ -80,22 +80,52 @@ function load() {
   const env = parsed.data;
 
   // Catch the single most damaging misconfiguration: serving production over
-  // plain HTTP. Secure cookies would silently never be set, so every session
-  // would break — better to refuse to boot than to be quietly broken.
+  // plain HTTP on a real domain. Secure cookies would silently never be set, so
+  // every session would break — better to refuse to boot than to be quietly
+  // broken.
+  //
+  // Loopback is exempt. `docker compose up` runs the production build against
+  // http://localhost:3000, which is the documented way to try this locally, and
+  // browsers treat localhost as a secure context — `Secure` cookies work there
+  // over plain HTTP. Rejecting it would block the quick start to prevent a
+  // problem that cannot occur.
   if (
     !isBuildPhase &&
     env.NODE_ENV === "production" &&
-    env.APP_ORIGIN.startsWith("http://")
+    env.APP_ORIGIN.startsWith("http://") &&
+    !isLoopback(env.APP_ORIGIN)
   ) {
     throw new Error(
-      "APP_ORIGIN must use https:// in production — session cookies are set " +
-        "`Secure` and would never reach the browser over plain HTTP.\n" +
-        "If you are deliberately running over plain HTTP on a trusted LAN, " +
-        "set NODE_ENV=development.",
+      `APP_ORIGIN is set to ${env.APP_ORIGIN}, but session cookies are marked ` +
+        "`Secure` in production and a browser will not send those over plain " +
+        "HTTP — every login would silently fail.\n\n" +
+        "Either put TLS in front and use https://, or set NODE_ENV=development " +
+        "if you are deliberately running unencrypted on a trusted network.",
     );
   }
 
   return env;
+}
+
+/**
+ * True for origins browsers treat as a secure context despite plain HTTP.
+ *
+ * Matches the WHATWG "potentially trustworthy origin" rules for loopback, which
+ * is what Chrome and Firefox actually implement.
+ */
+function isLoopback(origin: string): boolean {
+  try {
+    const host = new URL(origin).hostname.replace(/^\[|\]$/g, "");
+    return (
+      host === "localhost" ||
+      host.endsWith(".localhost") ||
+      host === "127.0.0.1" ||
+      host.startsWith("127.") ||
+      host === "::1"
+    );
+  } catch {
+    return false;
+  }
 }
 
 /** Treat an empty-string env var as absent, so a placeholder can fill in. */

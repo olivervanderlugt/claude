@@ -1,17 +1,16 @@
 # syntax=docker/dockerfile:1
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Quizzly — multi-stage build.
+# Quizzly — one image containing Next.js and the Socket.IO server sharing a
+# single port. Deployable to anything that runs a container.
 #
-# The result is one image containing Next.js and the Socket.IO server sharing a
-# single port, which is what makes this deployable to anything that runs a
-# container: Railway, Render, Fly, Coolify, a bare VPS.
-#
-# Deliberate choices:
-#  • Multi-stage, so build tooling never reaches the runtime image.
-#  • Non-root user. A container escape should not land on root.
-#  • `output: standalone` from next.config.ts, so only the traced dependencies
-#    are copied rather than the whole node_modules tree.
+# This deliberately copies the whole built app rather than using Next's
+# `output: standalone` tracing. Standalone only ships the dependencies Next
+# itself imports, which excludes the tsx runtime and the Prisma CLI that the
+# custom server and the migrate-on-boot step actually need — and it drops
+# node_modules/.bin entirely, so every binary the start command invokes goes
+# missing. The image is larger this way and it starts, which is the better
+# trade for something people self-host.
 # ─────────────────────────────────────────────────────────────────────────────
 
 ARG NODE_VERSION=22-alpine
@@ -34,8 +33,8 @@ WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 
-# `prisma generate` needs a DATABASE_URL to be present but never connects, so a
-# placeholder is fine here. The real one is injected at runtime.
+# `prisma generate` needs DATABASE_URL to be present but never connects, so a
+# placeholder is correct here. The real one is injected at runtime.
 ENV DATABASE_URL="postgresql://placeholder:placeholder@localhost:5432/placeholder"
 ENV NEXT_TELEMETRY_DISABLED=1
 
@@ -53,32 +52,18 @@ RUN apk add --no-cache libc6-compat wget && \
     addgroup --system --gid 1001 nodejs && \
     adduser --system --uid 1001 quizzly
 
-# The standalone output carries its own minimal node_modules; static assets and
-# the public folder have to be copied alongside it.
-COPY --from=builder --chown=quizzly:nodejs /app/.next/standalone ./
-COPY --from=builder --chown=quizzly:nodejs /app/.next/static ./.next/static
-COPY --from=builder --chown=quizzly:nodejs /app/public ./public
-
-# The custom server runs from TypeScript source via tsx, so it and its imports
-# ship too, along with Prisma's generated client and migrations.
-COPY --from=builder --chown=quizzly:nodejs /app/server ./server
-COPY --from=builder --chown=quizzly:nodejs /app/src ./src
-COPY --from=builder --chown=quizzly:nodejs /app/prisma ./prisma
-COPY --from=builder --chown=quizzly:nodejs /app/node_modules/.prisma ./node_modules/.prisma
-COPY --from=builder --chown=quizzly:nodejs /app/node_modules/@prisma ./node_modules/@prisma
-COPY --from=builder --chown=quizzly:nodejs /app/node_modules/tsx ./node_modules/tsx
-COPY --from=builder --chown=quizzly:nodejs /app/node_modules/esbuild ./node_modules/esbuild
-COPY --from=builder --chown=quizzly:nodejs /app/node_modules/get-tsconfig ./node_modules/get-tsconfig
-COPY --from=builder --chown=quizzly:nodejs /app/node_modules/resolve-pkg-maps ./node_modules/resolve-pkg-maps
-COPY --from=builder --chown=quizzly:nodejs /app/tsconfig.json ./tsconfig.json
-COPY --from=builder --chown=quizzly:nodejs /app/package.json ./package.json
+# The whole built tree, node_modules and its .bin symlinks included. Build
+# tooling never reaches this stage because the build ran in the previous one.
+COPY --from=builder --chown=quizzly:nodejs /app ./
 
 USER quizzly
 EXPOSE 3000
 
 # Fails the container if the app stops serving, so orchestrators restart it
-# rather than leaving a wedged process routed to.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+# rather than leaving a wedged process in rotation.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
   CMD wget --no-verbose --tries=1 --spider http://127.0.0.1:3000/api/health || exit 1
 
-CMD ["node_modules/.bin/tsx", "server/index.ts"]
+# Applies committed migrations, then serves. `npm run` puts node_modules/.bin
+# on PATH, so nothing depends on a hard-coded binary path.
+CMD ["npm", "run", "start:migrate"]

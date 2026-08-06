@@ -32,8 +32,10 @@ const nextConfig: NextConfig = {
   reactStrictMode: true,
   poweredByHeader: false,
 
-  // Emits a minimal server bundle so the Docker runtime stage stays small.
-  output: "standalone",
+  // No `output: "standalone"`. This app is served by a custom server
+  // (server/index.ts) rather than Next's own, so the standalone bundle was
+  // never executed — and its dependency tracing omitted the runtime binaries
+  // the container needs. See the Dockerfile.
 
   experimental: {
     // Cap the size of Server Action payloads — quiz imports go through a
