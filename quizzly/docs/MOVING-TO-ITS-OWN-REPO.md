@@ -1,117 +1,137 @@
-# Moving this into its own repository
+# Move Quizzly into its own repo
 
-This folder is fully self-contained — its own `package.json`, `.gitignore`,
-`LICENSE`, `Dockerfile` and docs. Nothing outside `quizzly/` is referenced, so
-lifting it out is a copy, not a refactor.
+Follow these five steps in order. Copy each block, paste, press enter.
 
-It lives inside another repository only because the automation that generated it
-could not create a new GitHub repository on your behalf (the GitHub App returned
-`403 Resource not accessible by integration` — it can push to existing repos but
-not create new ones).
+Total time: about five minutes, most of it waiting for Docker.
 
-## ⚠️ This repository hosts more than one project
+---
 
-`quizzly/` is **not** the only thing here. There is a sibling project under
-`percentile/` (a consent-first analytics data network) on its own branch, built
-independently.
+## 1. Create the empty repo
 
-The two are fully isolated — different directories, different ports, different
-CI, no shared files — and it must stay that way. Concretely:
+Go to <https://github.com/new>.
 
-- **Everything Quizzly owns is under `quizzly/`.** There are no Quizzly files at
-  the repository root.
-- **Do not delete the repository root, `percentile/`, or `.github/`** when
-  extracting. The commands below only ever touch `quizzly/`.
-- If you extract Quizzly and then want to tidy up, delete **only** the
-  `quizzly/` directory — never the whole repo.
+- **Repository name:** `quizzly`
+- Leave **Add a README**, **.gitignore** and **licence** all **unticked**
 
-See "Staying out of each other's way" at the end for the details worth knowing
-if you keep both here.
+This folder already has all three. Ticking them creates a conflict on your
+first push.
 
-## The one-minute version
+Click **Create repository**, then come back here.
 
-Create an empty repo on GitHub called `quizzly` — **without** a README,
-`.gitignore` or licence, so there's nothing to merge — then:
+---
+
+## 2. Copy the folder out
 
 ```bash
-# From the parent of this folder
-cp -r quizzly ~/quizzly && cd ~/quizzly
+git clone https://github.com/olivervanderlugt/claude.git /tmp/claude-src
+cd /tmp/claude-src
+git checkout claude/kahoot-quiz-platform-mvp-uol97e
+cp -r quizzly ~/quizzly
+```
 
-git init
+You now have a complete, standalone copy at `~/quizzly`. The original repo is
+untouched.
+
+---
+
+## 3. Push it
+
+```bash
+cd ~/quizzly
+git init -b main
 git add .
 git commit -m "Initial commit: Quizzly"
-git branch -M main
 git remote add origin git@github.com:olivervanderlugt/quizzly.git
 git push -u origin main
 ```
 
-That's it. If you then want to tidy the parent repo, delete **only** the
-`quizzly/` directory — `percentile/` and `.github/` belong to the other project.
-
-## If you want to keep the commit history
-
-The commits for this folder live on the branch
-`claude/kahoot-quiz-platform-mvp-uol97e`. `git-filter-repo` can rewrite history
-so `quizzly/` becomes the root:
+If `git push` asks for a password, you don't have SSH keys set up. Run this
+instead and try the push again:
 
 ```bash
-git clone <parent-repo-url> quizzly-extract
-cd quizzly-extract
-
-# The Quizzly commits are NOT on the default branch — check the branch out first,
-# or filter-repo will find nothing to keep and hand you an empty repository.
-git checkout claude/kahoot-quiz-platform-mvp-uol97e
-
-# pip install git-filter-repo
-git filter-repo --subdirectory-filter quizzly
-
-git remote add origin git@github.com:olivervanderlugt/quizzly.git
-git push -u origin main
+git remote set-url origin https://github.com/olivervanderlugt/quizzly.git
 ```
 
-Two things to be careful about:
+---
 
-- **Work in a throwaway clone, and never push the rewritten history back to the
-  parent repository.** `filter-repo` discards every commit that does not touch
-  `quizzly/` — run against the parent's own remote, it would erase the other
-  project's history.
-- `filter-repo` refuses to run while a remote is still attached, which is why the
-  clone is fresh and `origin` is re-added only at the end. That safety check is
-  the thing standing between you and the previous bullet, so don't work around it.
+## 4. Create your secrets
 
-## Staying out of each other's way
+```bash
+cd ~/quizzly
+grep -v '^SESSION_SECRET=\|^ENCRYPTION_KEY=' .env.example > .env
+printf 'SESSION_SECRET=%s\nENCRYPTION_KEY=%s\n' \
+  "$(openssl rand -base64 32)" "$(openssl rand -base64 32)" >> .env
+```
 
-If you keep both projects in this repository, this is the current state — worth
-preserving:
+`.env` is gitignored and never gets committed, which is why you generate your
+own. The app checks these at startup and refuses to boot if they're missing or
+still set to the placeholder — that's deliberate.
 
-| | Quizzly | percentile |
-|---|---|---|
-| Directory | `quizzly/` | `percentile/` |
-| Default port | 3000 | 8787 |
-| Datastore | PostgreSQL (database `quizzly`) | in-memory |
-| CI workflow | none | `.github/workflows/percentile-ci.yml`, scoped to `percentile/**` |
-| Root-level files | none | none besides its own workflow |
+---
 
-The branches have **unrelated histories** (each starts from its own root commit),
-so merging both into a default branch needs
-`git merge --allow-unrelated-histories`. Because the two touch entirely disjoint
-paths, that merge produces no content conflicts.
+## 5. Run it
 
-If you ever add CI for Quizzly, path-scope it the way `percentile-ci.yml` does
-(`paths: ['quizzly/**']`) and give the file a distinct name. An unfiltered
-workflow would fire on the other project's commits and report failures against
-code it doesn't own.
+Needs Docker Desktop running. Install from <https://docker.com> if you haven't.
 
-The one environment variable both projects read is `PORT`. That is correct
-behaviour — hosting platforms inject it — but it means you should not export a
-single `PORT` into a shell where you intend to run both at once. Each project's
-own `.env` lives in its own directory, so the normal path is unaffected.
+```bash
+cd ~/quizzly
+docker compose up --build
+```
 
-## After the move
+Wait for `Quizzly ready on http://localhost:3000`, then in a **second terminal**:
 
-1. Copy `.env.example` to `.env` and generate the two secrets — see the README.
-2. Set the security contact placeholder at the top of `SECURITY.md`.
-3. Fill in the `[BRACKETED]` fields in `src/app/privacy/page.tsx` and
-   `src/app/terms/page.tsx` before running it publicly, and delete the operator
-   banners.
-4. Read `docs/LEGAL.md` §4 if you plan to commercialise this in the US.
+```bash
+cd ~/quizzly
+docker compose exec app node_modules/.bin/tsx prisma/seed.ts
+```
+
+Open <http://localhost:3000> and sign in:
+
+- **Email:** `demo@quizzly.local`
+- **Password:** `demo-password-123`
+
+You'll have a quiz with all ten question types. Click **Host**, then open the
+site on your phone and enter the PIN.
+
+To stop: `Ctrl-C`, then `docker compose down`.
+
+---
+
+## Done. What's next
+
+Open the folder in VS Code and start a Claude Code session there:
+
+```bash
+code ~/quizzly
+```
+
+Three things are worth doing before anyone else uses this, in priority order:
+
+1. **Add a password reset flow.** There isn't one — a forgotten password
+   currently means a lost account. Needs an email provider.
+2. **Add a nickname filter.** A nickname box in a classroom gets misused. Hosts
+   can remove players mid-game, but nothing is filtered automatically.
+3. **Fill in the legal pages.** `src/app/privacy/page.tsx` and
+   `src/app/terms/page.tsx` have `[BRACKETED]` placeholders and an orange
+   banner. Replace the placeholders, delete the banners.
+
+The full list of known gaps is in `SECURITY.md` under *Known limitations*.
+
+To switch on AI question drafting, add your key to `.env` and restart:
+
+```
+ANTHROPIC_API_KEY=sk-ant-...
+```
+
+Nothing else depends on it — every other feature works without it.
+
+---
+
+## One thing not to do
+
+The repo you cloned from in step 2 also contains an unrelated project under
+`percentile/`. Step 2 only copies `quizzly/` out and changes nothing, so you're
+safe by default.
+
+If you later want to tidy that repo, delete **only** the `quizzly/` directory.
+Don't delete the repo, `percentile/`, or `.github/`.
