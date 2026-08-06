@@ -142,6 +142,24 @@ Be aware of these before deploying at scale.
    reaches one is a hex colour validated by `themeSchema`, so the residual risk
    is limited to appearance.
 
+9. **`npm audit` reports three high-severity advisories, all transitive through
+   `next`, none reachable in this configuration.** As of the last check:
+
+   - **`postcss`** — arbitrary `.map` file disclosure and path traversal via an
+     attacker-controlled `sourceMappingURL` in a CSS comment. PostCSS only ever
+     runs here at build time over this repository's own stylesheets. No
+     user-submitted CSS exists anywhere in the app.
+   - **`sharp`** — inherited libvips CVEs. `sharp` is Next's image optimiser.
+     This app uses plain `<img>` tags, never `next/image`, and sets no
+     `images.remotePatterns` in `next.config.ts`, so no user-supplied image is
+     ever decoded server-side.
+
+   The only fix `npm audit` offers is `next@16`, a major upgrade. Deliberately
+   not taken: the exposure is nil today and a framework major deserves its own
+   change, not a drive-by. **Re-check this when upgrading Next, and re-check the
+   reachability argument if you ever introduce `next/image` or accept CSS from
+   users** — either change makes these advisories live.
+
 ---
 
 ## Hardening checklist
