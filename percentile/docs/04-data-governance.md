@@ -73,7 +73,7 @@ Five checks, fail-closed at every step:
 | 2. k-anonymity | ≥10 contributing workspaces, ≥500 subjects | No individual app or person is inferable |
 | 3. Dominance | No workspace >34% of cohort subjects | 10 contributors where one is 90% is not an aggregate |
 | 4. Privacy budget | ε ≤ 1.0 per cohort per period | Blocks differencing attacks across repeated queries |
-| 5. Provenance | SHA-256 over consent-ledger head | Buyer can verify lineage without seeing data |
+| 5. Provenance | SHA-256 over the ledger head *and* the published statistics | Buyer can verify lineage without seeing data |
 
 Keeping this to one function is a deliberate bet: the entire compliance surface of the
 company is auditable in one file, and any future "just this once" bypass has to be written
@@ -83,6 +83,44 @@ Step 4 is the one most systems skip. k-anonymity is not sufficient for a *repeat
 queried* dataset — a buyer who asks for the same cohort weekly and watches it move can
 recover individual contributions even when every published cell cleared k. Adding noise
 without tracking cumulative ε spend is decoration.
+
+Percentiles use the **exponential mechanism**, not Laplace. This is not a detail. Laplace
+needs a sensitivity, and the intuitive choice — `(hi − lo) / n`, correct for a mean — is
+wrong for an order statistic and decays as 1/n, so larger cohorts would receive *less*
+noise while the true sensitivity stayed flat. Privacy would have degraded as the network
+grew, which is the exact inverse of the claim this business rests on. It was implemented
+that way, an internal red team recovered a single workspace's contribution from one
+published release with 100% accuracy over 120 trials, and it has since been replaced.
+
+Published contributor and subject counts are **generalised** to a coarse public ladder
+(10 / 25 / 50 / 100 / 250 …) rather than noised. That is generalisation, not differential
+privacy, and it is described that way here deliberately: Laplace on a count at this budget
+produces a scale of 60, which turns 25 contributors into 111. The concession is that a
+ladder crossing is observable; the alternative was an exact count, from which two releases
+can be differenced to recover an individual workspace.
+
+## What this design does not yet guarantee
+
+Two independent reviews — one legal, one adversarial — found the documentation above
+describing an architecture the code did not fully implement. Those gaps are tracked in
+[10-legal-review.md](10-legal-review.md) and [11-privacy-audit.md](11-privacy-audit.md).
+The ones that bear directly on the claims made here:
+
+- **Per-subject co-op consent is collected, hash-chained and tested — and not yet read by
+  the release path**, which filters on the developer's enrolment flag instead. Until that
+  is wired, the Recital 26 argument on this page is not supported by the running code.
+- **The ε budget is per (cohort, metric), and a person appears in many cohorts and many
+  periods.** Per-*release* ε is bounded; per-*individual lifetime* ε is not. A budget that
+  resets on a calendar boundary is arithmetically close to no budget at all, because a
+  calendar boundary is not a privacy boundary. Bounding it needs either bounded
+  participation with real deletion, or per-subject privacy accounting.
+- **The cohort-coarsening ladder produces nested, overlapping populations**, so parallel
+  composition does not apply and the rungs' budgets sum over the shared core.
+- **Special-category screening is in place at ingest but is a signal, not an oracle.** It
+  cannot catch a developer whose events are named `evt_001`.
+
+None of these is fatal to the design. All of them are fatal to the *claim* until fixed,
+which is why they are listed here rather than in a backlog.
 
 ### Decision 3 — Consent is layered, and withdrawal is sticky
 
