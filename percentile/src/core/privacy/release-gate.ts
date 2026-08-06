@@ -13,7 +13,7 @@
  *   1. consent filter      — drop observations lacking co-op consent
  *   2. k-anonymity         — contributors, subjects, dominance
  *   3. privacy budget      — refuse if this cohort's epsilon is exhausted
- *   4. noise injection     — Laplace on every published statistic
+ *   4. noise injection     — exponential mechanism for quantiles, Laplace for the mean
  *   5. provenance stamp    — bind the release to a consent-ledger head
  */
 
@@ -22,6 +22,7 @@ import type { AggregateRelease, CohortKey, WorkspaceObservation } from '../types
 import { checkKAnonymity, explainSuppression, type KAnonymityVerdict } from './k-anonymity.ts';
 import {
   DEFAULT_EPSILON_PER_QUERY,
+  exponentialQuantile,
   laplaceNoise,
   PrivacyBudget,
   clamp,
@@ -48,6 +49,26 @@ export interface ReleaseGateOptions {
 
 export function cohortKeyString(c: CohortKey): string {
   return `${c.builder}|${c.vertical}|${c.sizeBucket}|${c.period}`;
+}
+
+/**
+ * Public ladder used to generalise published counts. Fixed and public — a buyer can read it
+ * here, which is the point: a published figure of 250 means "somewhere in [250, 500)",
+ * and nothing finer is ever disclosed.
+ */
+const COUNT_LADDER = [
+  10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10_000, 25_000, 50_000, 100_000, 250_000,
+  500_000, 1_000_000,
+] as const;
+
+/** Snap a count down to the public ladder. Values below the floor report 0. */
+export function generaliseCount(n: number): number {
+  let out = 0;
+  for (const step of COUNT_LADDER) {
+    if (n >= step) out = step;
+    else break;
+  }
+  return out;
 }
 
 function percentile(sorted: readonly number[], p: number): number {
@@ -114,30 +135,61 @@ export function gateRelease(
     };
   }
 
-  // 4. Noise. One workspace is the unit of contribution to a cross-workspace statistic,
-  //    so sensitivity is scaled by the number of contributors, not the number of subjects.
-  const values = eligible.map((o) => clamp(o.value, metric.lo, metric.hi)).sort((a, b) => a - b);
-  const sensitivity = (metric.hi - metric.lo) / verdict.contributorCount;
-  const noisy = (v: number): number =>
-    clamp(v + laplaceNoise(sensitivity, epsilon / 6), metric.lo, metric.hi);
+  // 4. Noise.
+  //
+  //    Quantiles go through the exponential mechanism, NOT Laplace. Laplace here needs a
+  //    sensitivity, and the obvious choice — (hi-lo)/n, correct for a mean — is wrong for
+  //    an order statistic and decays as 1/n, so larger cohorts would get less noise while
+  //    the real sensitivity stays flat. See exponentialQuantile for the full reasoning.
+  //
+  //    The mean still uses Laplace, because (hi-lo)/n genuinely IS its sensitivity.
+  const values = eligible.map((o) => clamp(o.value, metric.lo, metric.hi));
 
-  // Split the budget across the six published statistics, then re-sort so noise cannot
-  // produce a non-monotonic percentile ladder (p75 below p50 reads as a bug to buyers).
+  // The budget splits across the six statistics that consume it: five percentiles and
+  // the mean. The published counts are generalised rather than noised (see below), so
+  // they draw nothing from the budget.
+  const share = epsilon / 6;
+
+  const quantile = (q: number): number =>
+    exponentialQuantile({ values, q, lo: metric.lo, hi: metric.hi, epsilon: share });
+
+  // Re-sorted so independent draws cannot produce a non-monotonic ladder. Sorting is
+  // post-processing and costs no privacy, but it does bias the extremes — p10 becomes the
+  // minimum of five draws — which is tolerable only because the exponential mechanism's
+  // draws are tightly concentrated. It was not tolerable under Laplace.
   const ladder = [
-    noisy(percentile(values, 0.1)),
-    noisy(percentile(values, 0.25)),
-    noisy(percentile(values, 0.5)),
-    noisy(percentile(values, 0.75)),
-    noisy(percentile(values, 0.9)),
+    quantile(0.1),
+    quantile(0.25),
+    quantile(0.5),
+    quantile(0.75),
+    quantile(0.9),
   ].sort((a, b) => a - b);
 
   const trueMean = values.reduce((a, b) => a + b, 0) / values.length;
+  const meanSensitivity = (metric.hi - metric.lo) / values.length;
+  const noisyMeanValue = clamp(
+    trueMean + laplaceNoise(meanSensitivity, share),
+    metric.lo,
+    metric.hi,
+  );
 
+  // Thresholds are decided on the exact counts; the *published* counts are generalised
+  // down to a public ladder. Exact counts let a buyer difference two releases and recover
+  // one workspace's subject count precisely — the headline way an "aggregate" leaks an
+  // individual contributor.
+  //
+  // Be precise about what this is: generalisation, not differential privacy. Laplace on a
+  // count at this budget is useless — at eps/6 = 0.017 the scale is 60, which turned a
+  // true 25 contributors into a published 111. Snapping to a coarse public ladder instead
+  // keeps the figure usable and means the common case (one workspace joins or leaves)
+  // does not move the published value at all. What it concedes is that a boundary
+  // crossing is observable; that is a bounded, much smaller leak than an exact count, and
+  // the ε budget still caps how many times a cohort can be asked.
   const release: AggregateRelease = {
     cohort,
     metric: metric.name,
-    contributorCount: verdict.contributorCount,
-    subjectCount: verdict.subjectCount,
+    contributorCount: generaliseCount(verdict.contributorCount),
+    subjectCount: generaliseCount(verdict.subjectCount),
     percentiles: {
       p10: ladder[0]!,
       p25: ladder[1]!,
@@ -145,22 +197,38 @@ export function gateRelease(
       p75: ladder[3]!,
       p90: ladder[4]!,
     },
-    mean: noisy(trueMean),
+    mean: noisyMeanValue,
     epsilonSpent: epsilon,
     provenanceHash: '',
   };
 
   // 5. Provenance. Binds the numbers to the consent state they were derived from, so a
   //    buyer's compliance team can verify lineage without seeing any underlying data.
+  //
+  //    The preimage covers the published statistics, not just the counts. Committing to
+  //    the counts alone let two releases built from opposite distributions produce
+  //    identical stamps, and left a post-hoc edit of p50 undetectable — a stamp that
+  //    proves nothing a buyer actually cares about.
   release.provenanceHash = createHash('sha256')
     .update(
       [
         consentLedgerHead,
         cohortKeyString(cohort),
         metric.name,
-        verdict.contributorCount,
-        verdict.subjectCount,
+        metric.lo,
+        metric.hi,
+        release.contributorCount,
+        release.subjectCount,
+        release.percentiles.p10,
+        release.percentiles.p25,
+        release.percentiles.p50,
+        release.percentiles.p75,
+        release.percentiles.p90,
+        release.mean,
         epsilon,
+        opts.minContributors ?? '',
+        opts.minSubjects ?? '',
+        opts.maxContributorShare ?? '',
       ].join(' '),
     )
     .digest('hex');

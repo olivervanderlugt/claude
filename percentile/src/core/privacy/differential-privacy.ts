@@ -71,6 +71,105 @@ export function noisyCount(trueCount: number, epsilon: number): number {
   return Math.max(0, Math.round(trueCount + laplaceNoise(1, epsilon)));
 }
 
+/**
+ * ε-differentially-private quantile via the exponential mechanism.
+ *
+ * Laplace noise on a quantile is simply the wrong mechanism, and the error is easy to
+ * make because it looks right. `(hi - lo) / n` is the correct global sensitivity for a
+ * *mean* over n bounded contributions. For an order statistic it is wrong: changing one
+ * contributor can move a quantile by the whole gap to its neighbour, and that gap does
+ * not shrink with n. `{0, 0, 1}` versus `{0, 1, 1}` moves the median the entire domain
+ * with one changed value.
+ *
+ * The consequence of getting this wrong is perverse rather than merely sloppy: a
+ * sensitivity that decays as 1/n means *larger* cohorts receive *less* noise while the
+ * real sensitivity stays flat. Privacy degrades as the network grows — the exact inverse
+ * of what a data co-op needs to be able to claim.
+ *
+ * The exponential mechanism instead scores each gap between sorted values by how close
+ * its rank is to the target, and samples a gap with probability proportional to
+ *
+ *     (width of gap) x exp(-ε |rank - target| / 2)
+ *
+ * The rank utility has sensitivity 1, hence the /2. Wide gaps are favoured because a
+ * value drawn from a wide gap is less informative about any individual contribution.
+ *
+ * Utility is dramatically better than Laplace at the same ε for small cohorts, which
+ * matters commercially as much as legally: at k=10 the Laplace version published a
+ * median of exactly 0 or 1 about 85% of the time, i.e. the benchmark was unusable at
+ * precisely the cohort size the whole go-to-market is built around.
+ *
+ * Reference: Smith, "Privacy-preserving statistical estimation with optimal convergence
+ * rates" (STOC 2011).
+ */
+export function exponentialQuantile(input: {
+  values: readonly number[];
+  /** Target quantile in [0, 1]. */
+  q: number;
+  /** Public domain bounds. Must come from the metric definition, never from the data. */
+  lo: number;
+  hi: number;
+  epsilon: number;
+}): number {
+  const { q, lo, hi, epsilon } = input;
+  if (epsilon <= 0) throw new Error('dp: epsilon must be positive');
+  if (q < 0 || q > 1) throw new Error('dp: q must be within 0..1');
+  if (hi <= lo) throw new Error('dp: hi must exceed lo');
+  if (input.values.length === 0) throw new Error('dp: cannot take a quantile of zero values');
+
+  // Clamp and sort, then bracket with the public domain bounds so the candidate set is
+  // [lo, z_1, ..., z_n, hi]. Using the data's own min/max as endpoints would leak them.
+  const z = input.values.map((v) => clamp(v, lo, hi)).sort((a, b) => a - b);
+  const n = z.length;
+  const bounds = [lo, ...z, hi];
+
+  const target = q * n;
+
+  // Log-weights, so a large ε cannot overflow exp(). Gap i spans bounds[i]..bounds[i+1]
+  // and corresponds to rank i.
+  const logWeights: number[] = new Array(n + 1);
+  let maxLog = -Infinity;
+  for (let i = 0; i <= n; i++) {
+    const width = bounds[i + 1]! - bounds[i]!;
+    if (width <= 0) {
+      logWeights[i] = -Infinity; // zero-width gaps can never be selected
+      continue;
+    }
+    const lw = Math.log(width) - (epsilon * Math.abs(i - target)) / 2;
+    logWeights[i] = lw;
+    if (lw > maxLog) maxLog = lw;
+  }
+
+  if (maxLog === -Infinity) {
+    // Every gap has zero width: all values identical and equal to a bound. Nothing to
+    // sample, and no information to protect beyond the value itself.
+    return clamp(z[0]!, lo, hi);
+  }
+
+  // Softmax in a numerically stable form.
+  let total = 0;
+  const weights = logWeights.map((lw) => {
+    const w = lw === -Infinity ? 0 : Math.exp(lw - maxLog);
+    total += w;
+    return w;
+  });
+
+  let draw = secureUniform() * total;
+  let chosen = weights.length - 1;
+  for (let i = 0; i < weights.length; i++) {
+    draw -= weights[i]!;
+    if (draw <= 0) {
+      chosen = i;
+      break;
+    }
+  }
+
+  // Uniform within the selected gap.
+  const a = bounds[chosen]!;
+  const b = bounds[chosen + 1]!;
+  return clamp(a + secureUniform() * (b - a), lo, hi);
+}
+
 /** Tracks cumulative epsilon spend per cohort key. Refuses releases once exhausted. */
 export class PrivacyBudget {
   #spent = new Map<string, number>();
